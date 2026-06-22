@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# 第三方源码缓存：用于查阅与拷贝，不纳入本仓库版本管理
+# （真正使用的 kernel 会被拷贝到各变体目录，并在文件头标注来源）
+.sources/
+
+# 基准产物
+*.png
+!docs/**/*.png
+bench_results/
+
+# 系统
+.DS_Store

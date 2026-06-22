@@ -1,0 +1,15 @@
+# 核心依赖（本仓库在 RTX 4090 + CUDA 12 + PyTorch 2.x 上开发验证）
+torch>=2.4
+triton>=3.0
+einops>=0.8
+
+# 测试与基准
+pytest>=8.0
+numpy
+
+# notebook 呈现与可视化
+jupyter
+matplotlib>=3.7
+
+# 可选：作为对照 baseline 的官方 CUDA 实现，编译较慢，不装也能跑通本仓库
+# flash-attn>=2.5

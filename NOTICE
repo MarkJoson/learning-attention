@@ -1,0 +1,53 @@
+learning-attention —— 第三方来源与 License 汇总
+================================================
+
+本仓库以"学习"为目的，精读并拷贝了多个开源项目的 Triton/CUDA kernel 实现。
+所有拷贝来的代码均：
+  1. 在文件头保留/标注原始来源（仓库、文件路径、commit）与原始 license；
+  2. 在对应变体目录的 SOURCES.md 中登记；
+  3. 在本文件汇总。
+
+自写部分（参考实现、测试、基准、文档、notebook）默认采用 MIT License。
+拷贝部分的版权与 license 归原作者所有，使用时请遵循其原始条款。
+
+--------------------------------------------------------------------------------
+已登记来源
+--------------------------------------------------------------------------------
+
+[1] triton-lang/triton
+    用途   : FlashAttention v2 的 Triton kernel
+    文件   : python/tutorials/06-fused-attention.py
+    tag    : v3.1.0 / cf34004b8a67d290a962da166f5aa2fc66751326
+    license: MIT (Copyright 2018-2020 Philippe Tillet; 2020-2022 OpenAI)
+    用于   : 02-flash-attention/
+    说明   : Tri Dao 的 FlashAttention v2 算法，OpenAI kernel team 编写。选 v3.1.0
+             经典版（非最新 TMA 版，4090 无法运行），仅调 autotune 参数适配 RTX 4090，
+             计算逻辑未改。
+
+[2] vllm-project/vllm
+    用途   : 原生 GQA/MQA 的 prefill attention kernel（含 sliding window、varlen）
+    文件   : vllm/v1/attention/ops/triton_prefill_attention.py
+    commit : 435f82d61a1eddb84854ca59a008a8e4d97ab439
+    license: Apache-2.0（原始来源链 LightLLM → SGLang → vLLM，文件内保留其 license 头）
+    用于   : 03-gqa-mqa/、04-sliding-window/（复用同一 kernel）
+    说明   : 仅去除 3 个 vLLM 内部依赖（current_platform / triton_utils / RCP_LN2），
+             kernel 计算逻辑一字未改。
+
+[3] ModelTC/lightllm（两个 kernel，license Apache-2.0，commit 9ae6a5d4886312bd827295f3cb0de231639f0c77）
+    (a) paged decode attention（block table 间接寻址）
+        文件: lightllm/common/basemodel/triton_kernel/att/decode_att/gqa/
+              gqa_decode_flashattention_nopad.py
+        用于: 05-paged-attention/；依赖本就干净（torch/triton/math），原样拷贝。
+    (b) MLA prefill attention（deepseek2，absorb 格式，latent 维度计算）
+        文件: lightllm/models/deepseek2/triton_kernel/context_flashattention_nopad.py
+        用于: 06-mla/；去除 1 个 is_tesla 依赖 + 针对 4090 收紧 BLOCK，计算逻辑未改。
+
+--------------------------------------------------------------------------------
+待登记（随变体推进补充）
+--------------------------------------------------------------------------------
+
+- fla-org/flash-linear-attention   —— GLA / DeltaNet / Gated DeltaNet / KDA（线性线）
+- lucidrains/native-sparse-attention-pytorch —— NSA（稀疏线）
+- epfml/dynamic-sparse-flash-attention       —— DSA（稀疏线）
+- flashinfer-ai/flashinfer         —— 推理 attention kernel 接口
+- Dao-AILab/flash-attention        —— 工程接口参考
