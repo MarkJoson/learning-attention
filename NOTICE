@@ -60,11 +60,21 @@ learning-attention —— 第三方来源与 License 汇总
     说明   : naive 版完整拷贝、计算逻辑未改；efficient 版依赖 flash-attn==2.6.3（本环境未装），仅供阅读。
              07 深度优化版本身复用 08 的 NSA kernel（见 [4]），未引入新 kernel。
 
+[6] fla-org/flash-linear-attention
+    用途   : Gated Linear Attention (GLA) 的 chunk-parallel triton kernel（线性注意力线）
+    文件   : ops/gla/chunk.py + ops/common/chunk_h.py + ops/utils/cumsum.py（解耦到本地三件套）
+    commit : 0b27f7b
+    license: MIT (Copyright fla-org)
+    用于   : 10-linear-attention/
+    说明   : 完整拷贝核心 kernel（计算逻辑一字未改），仅把对 fla 框架的 import 改指向本地薄适配层
+             _fla_compat.py（复现 exp2/autotune/check_shared_mem/input_guard 等），脱离 fla 包独立运行；
+             定长与变长（cu_seqlens）序列均支持。test_gla_triton 验证与 fla 原版近 bitwise 一致（含变长）。
+
 --------------------------------------------------------------------------------
 待登记（随变体推进补充）
 --------------------------------------------------------------------------------
 
-- fla-org/flash-linear-attention   —— GLA / DeltaNet / Gated DeltaNet / KDA（线性线）
+- fla-org/flash-linear-attention   —— DeltaNet / Gated DeltaNet / KDA（线性线 11/12；GLA 已登记 [6]）
 - epfml/dynamic-sparse-flash-attention       —— DSA（稀疏线）
 - flashinfer-ai/flashinfer         —— 推理 attention kernel 接口
 - Dao-AILab/flash-attention        —— 工程接口参考

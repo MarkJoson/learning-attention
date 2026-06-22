@@ -51,7 +51,7 @@
 | 07 | [block-sparse-attention](./07-block-sparse-attention/) | 稀疏 | 自写简要版 + 复用 08 NSA kernel + MoBA 对照 | ✅ 完成 |
 | 08 | [native-sparse-attention](./08-native-sparse-attention/) | 稀疏 | 自写三分支 + lucidrains NSA triton kernel（完整提取） | ✅ 完成 |
 | 09 | dynamic-sparse-attention | 稀疏 | epfml DSA | 📋 计划 |
-| 10 | linear-attention / GLA | 线性 | fla-org/flash-linear-attention | 📋 计划 |
+| 10 | [linear-attention](./10-linear-attention/) | 线性 | 自写三形式 + 解耦 fla GLA chunk kernel | ✅ 完成 |
 | 11 | deltanet | 线性 | fla-org/flash-linear-attention | 📋 计划 |
 | 12 | gated-deltanet / KDA | 线性 | fla-org / Kimi Linear | 📋 计划 |
 

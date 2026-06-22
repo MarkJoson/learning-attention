@@ -20,3 +20,6 @@ matplotlib>=3.7
 
 # 可选：07 MoBA 高效版对照（moba_efficient.py，仅阅读；moba_naive.py 无需任何额外依赖）
 # flash-attn==2.6.3
+
+# 可选：10 GLA 深度优化版的忠实性测试对照（解耦后的本地 kernel 本身不依赖 fla）
+# pip install --no-deps flash-linear-attention   # 务必 --no-deps，避免改动 torch/triton 版本
