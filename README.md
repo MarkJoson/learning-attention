@@ -52,8 +52,8 @@
 | 08 | [native-sparse-attention](./08-native-sparse-attention/) | 稀疏 | 自写三分支 + lucidrains NSA triton kernel（完整提取） | ✅ 完成 |
 | 09 | dynamic-sparse-attention | 稀疏 | epfml DSA | 📋 计划 |
 | 10 | [linear-attention](./10-linear-attention/) | 线性 | 自写三形式 + 解耦 fla GLA chunk kernel | ✅ 完成 |
-| 11 | deltanet | 线性 | fla-org/flash-linear-attention | 📋 计划 |
-| 12 | gated-deltanet / KDA | 线性 | fla-org / Kimi Linear | 📋 计划 |
+| 11 | [deltanet](./11-deltanet/) | 线性 | 自写 delta rule + 完整解耦 fla DeltaNet kernel | ✅ 完成 |
+| 12 | [kda](./12-kda/) | 线性 | 自写 gated delta + 完整解耦 fla KDA kernel（Kimi Linear） | ✅ 完成 |
 
 > 状态：✅ 完成 · 🚧 进行中 · 📋 计划。按"先做样板、验收后批量推进"的方式逐步补齐。
 
