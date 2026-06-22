@@ -42,12 +42,29 @@ learning-attention —— 第三方来源与 License 汇总
         文件: lightllm/models/deepseek2/triton_kernel/context_flashattention_nopad.py
         用于: 06-mla/；去除 1 个 is_tesla 依赖 + 针对 4090 收紧 BLOCK，计算逻辑未改。
 
+[4] lucidrains/native-sparse-attention-pytorch
+    用途   : NSA（Native Sparse Attention）的稀疏 flash kernel（selected + sliding，含 backward、GQA）
+    文件   : native_sparse_attention_pytorch/triton_native_sparse_attention.py
+    版本   : pip native-sparse-attention-pytorch==0.2.3
+    license: MIT (Copyright Phil Wang / lucidrains)
+    用于   : 08-native-sparse-attention/
+    说明   : 完整提取整份 1987 行 kernel，仅去除 1 个 tensor_typing（jaxtyping 注解）依赖，
+             计算逻辑一字未改。kernel 谱系改编自 Dao-AILab/flash-attention 的 triton flash。
+
+[5] MoonshotAI/MoBA（Kimi Mixture of Block Attention）
+    用途   : 动态块稀疏（chunk 级 top-k 选块 + 当前块必选）的对照实现
+    文件   : moba/moba_naive.py（纯 PyTorch 参考，可跑）、moba/moba_efficient.py（flash_attn 编排，仅阅读）
+    commit : b5d58363311d3ca946f1ec444182727c15e338b5
+    license: MIT (Copyright © 2025 Moonshot AI)
+    用于   : 07-block-sparse-attention/（NSA 之外另一条动态块稀疏路线的对照）
+    说明   : naive 版完整拷贝、计算逻辑未改；efficient 版依赖 flash-attn==2.6.3（本环境未装），仅供阅读。
+             07 深度优化版本身复用 08 的 NSA kernel（见 [4]），未引入新 kernel。
+
 --------------------------------------------------------------------------------
 待登记（随变体推进补充）
 --------------------------------------------------------------------------------
 
 - fla-org/flash-linear-attention   —— GLA / DeltaNet / Gated DeltaNet / KDA（线性线）
-- lucidrains/native-sparse-attention-pytorch —— NSA（稀疏线）
 - epfml/dynamic-sparse-flash-attention       —— DSA（稀疏线）
 - flashinfer-ai/flashinfer         —— 推理 attention kernel 接口
 - Dao-AILab/flash-attention        —— 工程接口参考

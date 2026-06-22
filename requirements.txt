@@ -2,6 +2,7 @@
 torch>=2.4
 triton>=3.0
 einops>=0.8
+einx>=0.3            # 08 NSA 深度优化版 kernel（nsa_triton.py）依赖
 
 # 测试与基准
 pytest>=8.0
@@ -13,3 +14,9 @@ matplotlib>=3.7
 
 # 可选：作为对照 baseline 的官方 CUDA 实现，编译较慢，不装也能跑通本仓库
 # flash-attn>=2.5
+
+# 可选：08 NSA 深度优化版的输入准备与测试对照（提供 SparseAttention Module；nsa_triton.py 本身不需要它）
+# native-sparse-attention-pytorch==0.2.3
+
+# 可选：07 MoBA 高效版对照（moba_efficient.py，仅阅读；moba_naive.py 无需任何额外依赖）
+# flash-attn==2.6.3

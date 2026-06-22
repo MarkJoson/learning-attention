@@ -48,11 +48,12 @@
 | 04 | [sliding-window](./04-sliding-window/) | 基础 | vLLM（复用 03 kernel，自带滑窗） | ✅ 完成 |
 | 05 | [paged-attention](./05-paged-attention/) | 推理 | lightllm（paged decode，间接寻址） | ✅ 完成 |
 | 06 | [mla](./06-mla/) | 推理 | lightllm MLA prefill + 自写参考（absorb） | ✅ 完成 |
-| 07 | native-sparse-attention | 稀疏 | lucidrains / DeepSeek | 📋 计划 |
-| 08 | dynamic-sparse-attention | 稀疏 | epfml | 📋 计划 |
-| 09 | linear-attention / GLA | 线性 | fla-org/flash-linear-attention | 📋 计划 |
-| 10 | deltanet | 线性 | fla-org/flash-linear-attention | 📋 计划 |
-| 11 | gated-deltanet / KDA | 线性 | fla-org / Kimi Linear | 📋 计划 |
+| 07 | [block-sparse-attention](./07-block-sparse-attention/) | 稀疏 | 自写简要版 + 复用 08 NSA kernel + MoBA 对照 | ✅ 完成 |
+| 08 | [native-sparse-attention](./08-native-sparse-attention/) | 稀疏 | 自写三分支 + lucidrains NSA triton kernel（完整提取） | ✅ 完成 |
+| 09 | dynamic-sparse-attention | 稀疏 | epfml DSA | 📋 计划 |
+| 10 | linear-attention / GLA | 线性 | fla-org/flash-linear-attention | 📋 计划 |
+| 11 | deltanet | 线性 | fla-org/flash-linear-attention | 📋 计划 |
+| 12 | gated-deltanet / KDA | 线性 | fla-org / Kimi Linear | 📋 计划 |
 
 > 状态：✅ 完成 · 🚧 进行中 · 📋 计划。按"先做样板、验收后批量推进"的方式逐步补齐。
 
