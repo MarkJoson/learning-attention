@@ -54,6 +54,8 @@
 | 10 | [linear-attention](./10-linear-attention/) | 线性 | 自写三形式 + 解耦 fla GLA chunk kernel | ✅ 完成 |
 | 11 | [deltanet](./11-deltanet/) | 线性 | 自写 delta rule + 完整解耦 fla DeltaNet kernel | ✅ 完成 |
 | 12 | [kda](./12-kda/) | 线性 | 自写 gated delta + 完整解耦 fla KDA kernel（Kimi Linear） | ✅ 完成 |
+| 13 | [gated-deltanet](./13-gated-deltanet/) | 线性 | 自写 GDN/GDN-2 recurrent + 完整解耦 fla GDN（9）+ GDN-2（13）kernel（Qwen3-Next/3.5） | ✅ 完成 |
+| 14 | [deepseek-v4](./14-deepseek-v4/) | 稀疏 | 自写 CSA+HCA 混合压缩稀疏简要版（讲机制 + 指向来源，DeepSeek V4） | ✅ 完成 |
 
 > 状态：✅ 完成 · 🚧 进行中 · 📋 计划。按"先做样板、验收后批量推进"的方式逐步补齐。
 

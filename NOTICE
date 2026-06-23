@@ -61,14 +61,28 @@ learning-attention —— 第三方来源与 License 汇总
              07 深度优化版本身复用 08 的 NSA kernel（见 [4]），未引入新 kernel。
 
 [6] fla-org/flash-linear-attention
-    用途   : 线性注意力线的 chunk-parallel triton kernel —— GLA（10）+ DeltaNet（11，delta rule/WY）+ KDA（12，gated delta）
-    文件   : ops/gla/chunk.py + ops/common/chunk_h.py + ops/utils/cumsum.py（解耦到本地三件套）
+    用途   : 线性注意力线的 chunk-parallel triton kernel —— GLA（10）+ DeltaNet（11，delta rule/WY）+ KDA（12，
+             gated delta）+ GDN/GDN-2（13，门控 delta，Qwen3-Next/3.5）
+    文件   : ops/gla/chunk.py + ops/common/chunk_h.py + ops/utils/cumsum.py（解耦到本地三件套）；
+             ops/gated_delta_rule/* + ops/gdn2/* + ops/kda/*（13 章复用，详见各章 SOURCES.md）
     commit : 0b27f7b
     license: MIT (Copyright fla-org)
-    用于   : 10-linear-attention/（GLA，3 文件）、11-deltanet/（DeltaNet，8 文件）、12-kda/（KDA，14 文件；no-op dispatch + cp stub 收敛闭包脱离 fla）
+    用于   : 10-linear-attention/（GLA，3 文件）、11-deltanet/（DeltaNet，8 文件）、12-kda/（KDA，14 文件）、
+             13-gated-deltanet/（GDN 9 文件 + GDN-2 13 文件；no-op dispatch + cp stub + 跨章复用收敛闭包脱离 fla）
     说明   : 完整拷贝核心 kernel（计算逻辑一字未改），仅把对 fla 框架的 import 改指向本地薄适配层
-             _fla_compat.py（复现 exp2/autotune/check_shared_mem/input_guard 等），脱离 fla 包独立运行；
-             定长与变长（cu_seqlens）序列均支持。test_gla_triton 验证与 fla 原版近 bitwise 一致（含变长）。
+             _fla_*_compat.py（复现 exp2/autotune/check_shared_mem/input_guard 等），脱离 fla 包独立运行；
+             定长与变长（cu_seqlens）序列均支持。各章 test_*_vs_fla 验证与 fla 原版近 bitwise 一致（含变长）。
+
+[7] DeepSeek V4 Hybrid Attention（CSA + HCA）—— 仅指向来源，未提取 kernel
+    用途   : 长上下文混合压缩稀疏注意力机制（CSA 压缩+稀疏选块 / HCA 极致压缩+稠密）
+    来源   : DeepSeek-V4 技术报告（deepseek-ai/DeepSeek-V4-Pro, HuggingFace, 2026-04）；
+             vLLM DeepSeek-V4 实现（FP4 indexer / FP8 core / KV cache 布局）；
+             NVIDIA Blackwell 部署博客《Build with DeepSeek V4》
+    license: 见各来源（DeepSeek 模型许可 / vLLM Apache-2.0）
+    用于   : 14-deepseek-v4/（自写简要版讲机制 + 指向来源）
+    说明   : 按用户约定本章**不提取**生产 kernel —— DSv4 不在 fla，生产实现在 vLLM/官方。14-deepseek-v4/
+             deepseek_v4.py 是**自写的纯 PyTorch 机制简化版**（compress→index→attend 主干），刻意省略 FP4/FP8
+             量化、dual-stream 重叠压缩、KV cache 工程等生产细节；详见 14-deepseek-v4/SOURCES.md。
 
 --------------------------------------------------------------------------------
 待登记（随变体推进补充）
