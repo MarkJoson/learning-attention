@@ -14,8 +14,12 @@ _CJK_FONTS = ["Noto Sans SC", "SimHei", "Microsoft YaHei", "WenQuanYi Micro Hei"
               "Source Han Sans SC", "Droid Sans Fallback"]
 
 
-def setup_cjk(fonts: list[str] | None = None) -> str:
-    """让 matplotlib 正常显示中文（否则中文是方框）。返回实际选用的首选字体名。"""
+def setup_cjk(fonts: list[str] | None = None, *, hidpi: bool = True) -> str:
+    """让 matplotlib 正常显示中文（否则中文是方框）+ 高清出图（否则高分屏下模糊）。
+
+    返回实际选用的首选字体名。``hidpi=True`` 时启用 retina（inline PNG 用 2× 分辨率）并提高 DPI，
+    解决 notebook 内联图模糊的问题。
+    """
     import matplotlib
     from matplotlib.font_manager import fontManager
 
@@ -24,6 +28,15 @@ def setup_cjk(fonts: list[str] | None = None) -> str:
     # 选中的中文字体放最前，保留原有 sans-serif 作英文/fallback
     matplotlib.rcParams["font.sans-serif"] = picked + list(matplotlib.rcParams["font.sans-serif"])
     matplotlib.rcParams["axes.unicode_minus"] = False  # 负号用 ASCII，避免缺字
+    if hidpi:
+        # retina：inline 后端用 2× 像素渲染 PNG（最有效的清晰度提升）；DPI 兜底非 inline 场景
+        matplotlib.rcParams["figure.dpi"] = 140
+        matplotlib.rcParams["savefig.dpi"] = 140
+        try:
+            from matplotlib_inline.backend_inline import set_matplotlib_formats
+            set_matplotlib_formats("retina")
+        except Exception:
+            pass
     return picked[0] if picked else "(未找到中文字体)"
 
 
