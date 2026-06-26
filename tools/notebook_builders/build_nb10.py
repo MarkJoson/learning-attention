@@ -3,6 +3,8 @@
 按 13-gdn 样板：数学逐步推导 + 全 LaTeX + 拆段精读 + 完整 kernel 源码备查 + retina 高清图。
 GLA 无擦除/WY，核心是"状态矩阵 + 矩阵结合律 O(S²)→O(S) + chunk(inter/intra) + 门控衰减"。
 """
+from pathlib import Path
+
 import nbformat as nbf
 
 nb = nbf.v4.new_notebook()
@@ -93,7 +95,7 @@ for Sd in [1024, 4096, 16384]:
     Dd = 128
     print(f"  {Sd:>6}      {Sd*Sd/1e6:>8.1f} M 元素（O(S²)）        {Dd*Dd/1e3:>6.1f} K 元素（O(1)）")
 print("\n→ 结合律把 S×S 的分数矩阵换成 K×V 的状态矩阵，复杂度 O(S²)→O(S)。")
-print("  注意：纯 Python 的 recurrent 因逐步循环开销在 GPU 上并不快——O(S) 的实测加速要靠 chunked kernel，见 §6。")
+print("  注意：纯 Python 的 recurrent 因逐步循环开销在 GPU 上并不快——O(S) 的实测加速要靠 chunked kernel，见 §7。")
 """.strip()))
 
 # ============================ 3. §2 三形式 ============================
@@ -240,9 +242,122 @@ print("→ 解耦 kernel 与 fla **bitwise** 一致（见 ①②，max diff=0）
 print("  精度差：GLA 不做 L2norm（delta 系靠归一化约束状态，GLA 没有），状态动态范围大、bf16 误差偏大，非逻辑差异。")
 """.strip()))
 
-# ============================ 7. §6 bench ============================
+# ============================ 7. §6 变长序列（cu_seqlens）============================
 cells.append(md(r"""
-## 6. 复杂度：$O(S)$ vs full attention $O(S^2)$
+## 6. 变长序列（cu_seqlens）怎么算
+
+前面所有验证都用**定长** batch `[B, T, H, D]`——同一 batch 里每条序列一样长。但真实训练里一个 batch 的序列**长短不一**
+（不同文档、不同对话）。把它们装进一个 batch 有两种办法：
+
+- **padding**：补到最长那条的长度 $T_{\max}$，短序列填一堆 pad token。序列长度差异越大，算力浪费在 pad 上越多；
+- **packing（变长）**：把 $N$ 条序列在时间维上**首尾拼成一条**（`batch=1`），用 `cu_seqlens` 记录每条的边界。**没有一个 pad
+  token**，算力全花在真实 token 上。
+
+线性注意力 / SSM 的 chunk kernel 都**原生支持变长**，靠 `cu_seqlens` 一个参数切换——`chunk_gla` 等 fla kernel 也是各章
+`test_*_vs_fla` 里验证变长的方式。
+
+**`cu_seqlens` 格式**：设 $N$ 条序列长度为 $\ell_0,\ell_1,\dots,\ell_{N-1}$，则 `cu_seqlens` 是它们的**前缀和**（含前导 0）：
+
+$$\bigl[\,0,\ \ell_0,\ \ell_0+\ell_1,\ \ldots,\ \textstyle\sum_{i}\ell_i\,\bigr].$$
+
+这是一个 int32、长度 $N{+}1$ 的张量；第 $n$ 条序列恰好占 packed 张量时间维的 `[cu_seqlens[n] : cu_seqlens[n+1]]`。
+输入 layout 也从定长的 `[B, T, H, D]` 变成 **`[1, total_len, H, D]`**（batch 维恒为 1，所有序列在第 2 维相接），
+门控 $g$ 同为 `[1, total_len, H, D]`。
+""".strip()))
+
+cells.append(md(r"""
+### chunk kernel 怎么处理变长：块不跨序列 + 状态按序列重置
+
+定长时每条序列各占一个 batch 行、彼此独立、各自从零状态递推。变长把多条序列塞进**同一条** packed 序列后，kernel 必须保证
+两件事，否则就会把上一条序列的信息泄漏给下一条：
+
+1. **块（chunk）不能跨序列边界**。定长时直接按 `chunk_size` 均匀切块即可；变长时若一个块横跨两条序列的接缝，§3 的 **intra**
+   项（块内因果注意力 $\operatorname{tril}(\phi Q\,\phi K^\top)V$）就会让后一条序列的 token attend 到前一条——错误。所以变长必须
+   **每条序列各自**按 `chunk_size` 分块，每条的最后一块允许不满（向上取整）。
+2. **状态矩阵 $S$ 在每条序列开头重置为 0**。§3 的 **inter** 项靠块间传递的状态 $S$，但它**不能跨序列 carry**：第 $n$ 条序列的第
+   一个块必须从 $S=0$ 起步，绝不能带入第 $n-1$ 条序列末尾的状态。
+
+这就是变长与定长**唯一**的本质区别——逐块的**计算公式一字不改**，只是"哪些块属于哪条序列、状态在哪里清零"要重新安排。这套
+映射由两个纯 torch 的索引函数在 kernel 启动前于 host 端算好（`_fla_compat.py`，拷自 fla `ops/utils/index.py`）。
+""".strip()))
+
+cells.append(md(r"""
+**`prepare_chunk_indices`** —— 把每条序列各自分块，给每个块打上 `(序列号, 序列内第几块)` 标签：
+
+```python
+# _fla_compat.py · prepare_chunk_indices（节选，floor-div 即 ceil 分块）
+def prepare_chunk_indices(cu_seqlens, chunk_size):
+    lens = prepare_lens(cu_seqlens)                       # 各序列长度 = diff(cu_seqlens)
+    chunk_counts = (lens + chunk_size - 1) // chunk_size  # 每条序列的块数 = ceil(len / chunk_size)
+    seg_id, intra_idx = _segmented_arange(chunk_counts)   # 展开成 (序列号, 序列内块号)
+    return torch.stack([seg_id, intra_idx], 1)
+```
+
+例：3 条序列长度 `[5, 7, 4]`、`chunk_size=4`，各切 `ceil([5,7,4]/4)=[2,2,1]` 块，共 5 块：
+
+| 全局块号 | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| `(序列号, 序列内块号)` | (0,0) | (0,1) | (1,0) | (1,1) | (2,0) |
+
+kernel 的 grid 按"总块数"（这里 5）启动，每个 block 先读出自己的 `(序列号 i_n, 块号 i_t)`，再用
+`bos, eos = cu_seqlens[i_n], cu_seqlens[i_n+1]` 定位这条序列在 packed 张量里的范围——块因此永远落在单条序列内部。
+
+**`prepare_chunk_offsets`** —— 各序列块数的前缀和（上例 `[2,2,1] → [0,2,4,5]`），让"块间状态"的存储缓冲在 packed batch 里
+按序列对齐：第 $n$ 条序列的状态块从 `offsets[n]` 开始写。状态递推内核 `_fla_chunk_h.py::chunk_fwd_h` 据此对**每条序列**把累加器
+`b_h = tl.zeros([BK, BV])` 重新置零、只在该序列的块范围 `for i_t in range(NT)`（`NT = ceil(本序列长度 / 块大小)`）内循环——
+这就在代码层面落实了"状态按序列重置、块不跨序列"。
+""".strip()))
+
+cells.append(md(r"""
+### 数值验证：packed 一次 == 逐条单独跑
+
+最有力的检验：3 条不等长序列，(a) 拼成 packed + `cu_seqlens` **一次**跑完，(b) 逐条**单独**当定长序列各跑一次再拼回。
+若"块不跨序列、状态按序列重置"成立，两者必**逐段一致**（到机器精度）。这次不依赖 fla——直接验证变长的**语义**。
+""".strip()))
+
+cells.append(code(r"""
+from _fla_gla_chunk import chunk_gla
+from _fla_compat import prepare_chunk_indices
+
+H, D = 4, 64
+lens = [100, 250, 160]                                  # 3 条不等长序列
+total = sum(lens)                                       # packed 后的总长
+cu = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(),
+                  device="cuda", dtype=torch.int32)     # [0, l0, l0+l1, total]
+print("cu_seqlens =", cu.tolist(), "  = [0, l0, l0+l1, total]")
+ci = prepare_chunk_indices(cu, 64).tolist()             # 每行 (序列号, 序列内块号)
+print(f"chunk_indices(chunk_size=64) = {ci}")
+print("  3 条序列各切 ceil([100,250,160]/64)=[2,4,3] 块，块号带序列标签、不跨序列\n")
+
+gg = torch.Generator("cuda").manual_seed(7)
+# packed layout: [1, total_len, H, D]（batch 维恒为 1，3 条序列在时间维首尾相接）
+qp = torch.randn(1, total, H, D, device="cuda", generator=gg)         # float32：packed 与逐条可逐位对齐（证明数学等价）
+kp = torch.randn(1, total, H, D, device="cuda", generator=gg)
+vp = torch.randn(1, total, H, D, device="cuda", generator=gg)
+gp = F.logsigmoid(torch.randn(1, total, H, D, device="cuda", generator=gg))
+
+# (a) packed 一次跑完：传 cu_seqlens，kernel 自动按边界分块、每条序列状态独立
+o_packed, _ = chunk_gla(qp, kp, vp, gp, cu_seqlens=cu)
+
+# (b) 逐条单独当定长序列各跑一次（不传 cu_seqlens，各自从零状态开始），再沿时间维拼回
+o_each = []
+for i in range(len(lens)):
+    bos, eos = cu[i].item(), cu[i + 1].item()
+    qi, ki, vi, gi = (x[:, bos:eos].contiguous() for x in (qp, kp, vp, gp))
+    oi, _ = chunk_gla(qi, ki, vi, gi)
+    o_each.append(oi)
+o_each = torch.cat(o_each, dim=1)
+
+diff = (o_packed.float() - o_each.float()).abs().max().item()
+print(f"packed(cu_seqlens 一次) vs 逐条单独跑   max diff: {diff:.2e}")
+print("→ packed 跑出的每条序列 == 单独跑该序列（float32 逐位对齐）：chunk 没跨序列、状态在每条序列开头")
+print("  都重置了——这就是变长与定长的唯一区别。（bf16 下因 packed/逐条 shape 不同触发不同 autotune config，")
+print("  会有 ~1e-2 量级累积差异，属精度噪声、非逻辑差异。）")
+""".strip()))
+
+# ============================ 8. §7 bench ============================
+cells.append(md(r"""
+## 7. 复杂度：$O(S)$ vs full attention $O(S^2)$
 
 GLA 是线性复杂度，长序列优于 full attention；门控带来选择性记忆，质量优于无门控的朴素 linear attention。
 """.strip()))
@@ -273,16 +388,28 @@ for i, S in enumerate(Ss):
     print(f"S={S:>5}  full {full[i]:6.3f}ms  GLA {gla_t[i]:6.3f}ms ({full[i]/gla_t[i]:.2f}×)")
 """.strip()))
 
-# ============================ 8. 收尾 ============================
+# ============================ 9. 动手练习 ============================
 cells.append(md(r"""
-## 7. 收尾
+## 🛠 动手练习
+
+1. **退化验证**：把 GLA 的门控 `g` 全设 0，验证它精确退化为无门控的 linear attention（`linear_attn_recurrent`）。
+2. **三形式的取舍**：parallel / recurrent / chunked 在 `S=8192` 时哪个显存最省？为什么 causal 下 parallel 仍是 $O(S^2)$？
+   （提示：causal mask 需要显式的 $S\times S$ 分数矩阵。）
+3. **chunk_size 的影响**：把 `chunk_size` 改成 16 / 64 / 256，看 `chunk ≡ recurrent` 的误差和速度怎么变——块越大并行度越高，
+   但块内 $O(C^2)$ 部分越重。
+""".strip()))
+
+# ============================ 10. §8 收尾 ============================
+cells.append(md(r"""
+## 8. 收尾
 
 线性注意力把 $O(S^2)$ 的注意力变成了一个固定大小**状态矩阵**的 $O(S)$ 递推：
 
 1. **矩阵结合律**（§1）：$\phi(Q)\bigl(\phi(K)^\top V\bigr)$ 把 $S\times S$ 分数矩阵换成 $K\times V$ 状态矩阵；
 2. **三种等价形式**（§2–§3）：parallel（概念）/ recurrent（ground truth）/ chunked（块内并行 + 块间传状态，kernel 骨架）；
 3. **GLA 门控**（§4–§5）：$\operatorname{diag}(e^{g_t})$ 让状态 data-dependent 地选择性遗忘，是后续 KDA/GDN 门控的来源；
-4. **完整 kernel**（§5）：本仓库完整解耦自 fla、与原版数值一致。
+4. **完整 kernel**（§5）：本仓库完整解耦自 fla、与原版数值一致；
+5. **变长序列**（§6）：packing + `cu_seqlens` 把多条不等长序列拼成一条免 padding，chunk kernel 靠"块不跨序列 + 状态按序列重置"保证正确——这是 chunked 形式天然支持、softmax attention 也共用的训练高效技巧。
 
 GLA 的写入仍是"只加"——**下一章** → 11-deltanet 引入 delta rule 的"先擦后写"，给状态装上橡皮擦；再到 12 KDA 把门控与
 擦除合一、13 GDN 把擦/写解耦。这条线就是围绕"状态矩阵怎么更新"一步步加机制。
@@ -290,6 +417,6 @@ GLA 的写入仍是"只加"——**下一章** → 11-deltanet 引入 delta rule
 
 nb["cells"] = cells
 nb["metadata"]["kernelspec"] = {"display_name": "learnattn", "language": "python", "name": "learnattn"}
-out = "/home/robomaster/Research/learning-attention/10-linear-attention/linear.ipynb"
-nbf.write(nb, out)
+out = Path(__file__).resolve().parents[2] / "10-linear-attention" / "linear.ipynb"
+nbf.write(nb, str(out))
 print("写入", out, "·", len(cells), "cells")
