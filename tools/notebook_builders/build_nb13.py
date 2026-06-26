@@ -536,9 +536,222 @@ except ImportError:
     print("（未装 fla，跳过原版对照）")
 """.strip()))
 
-# ============================ 9. §8 bench ============================
+# ============================ 8.5 §8 反向传播 ============================
 cells.append(md(r"""
-## 8. 复杂度：$O(S)$ vs full attention $O(S^2)$
+## 8. 反向传播：两个变体的梯度
+
+§1–§7 都在讲 forward；训练靠 backward。GDN 系列的 `chunk_bwd` 和 DeltaNet（第 11 章 §6）同构，难在那两处，
+gated 版再加门控：
+
+1. 状态 $S$ 块间**串行 carry** → backward 必须**反向扫描**（BPTT，从后往前累积状态梯度 $dS$）；
+2. WY 表示里有**矩阵求逆** $T=(I+L)^{-1}$ → 它的反向是**矩阵求逆的梯度**；
+3. 门控 / 双门把 $e^{g^{\mathrm{cum}}}$、$b$、$w$ 折进各处 → 反向多出 $dg$（per-channel 或标量），以及 GDN-2 的 $db,dw$。
+
+下面**两个变体都推**：先 GDN v1（per-head 标量 $g$ + 单 $\beta$），再 GDN-2（per-channel $g$ + erase/write 双门 $b,w$），
+都手推**完整 backward** 用 autograd **逐位钉死**。
+""".strip()))
+
+cells.append(md(r"""
+### 8.1 GDN v1：三个关键反向（标量门控）
+
+GDN v1 就是 **KDA 把门控退化成 per-head 标量**（单 $\beta$）。记 forward（块 $n$，$S$ 进入状态，$\gamma=g$ 块内前缀和、标量），
+把衰减折进 $\hat k=k\odot e^{\gamma},\ \bar k=k\odot e^{-\gamma},\ \hat q=q\odot e^{\gamma}$：
+
+$$L_n=\operatorname{strict\_tril}(\operatorname{diag}(\beta)\hat K\bar K^\top),\ T_n=(I+L_n)^{-1},\ U=T_n(\beta\odot v),\ W=T_n(\beta\odot\hat k),\ A_n=\operatorname{tril}(\hat Q\bar K^\top),$$
+$$\tilde u_n=U-WS,\quad o_n=\hat Q\,S+A_n\tilde u_n,\quad S'=e^{\gamma_{\text{last}}}S+k_{\text{tail}}^\top\tilde u_n,\quad k_{\text{tail}}=k\odot e^{\gamma_{\text{last}}-\gamma}.$$
+
+**① 块内**：$d\hat Q\mathrel{+}=do_n S^\top$、$dA_n=do_n\tilde u_n^\top$、$d\tilde u_n\mathrel{+}=A_n^\top do_n$（$A_n$ 梯度 mask 回下三角）。
+**② 块间 BPTT**：$dS\mathrel{+}=e^{\gamma_{\text{last}}}dS'$、$dk_{\text{tail}}=\tilde u_n dS'^\top$、$d\tilde u_n\mathrel{+}=k_{\text{tail}}dS'$，再配 $\tilde u_n=U-WS$ 补 $dS\mathrel{-}=W^\top d\tilde u_n$，**倒扫累积**。
+**③ WY 求逆梯度**：$dT_n=dU(\beta\odot v)^\top+dW(\beta\odot\hat k)^\top$，$dL_n=\operatorname{strict\_tril}(-T_n^\top dT_n T_n^\top)$。
+**门控 $dg$**：所有 $e^{\pm\gamma}$ 把梯度汇成 $d\gamma$（标量门 → 沿通道求和），$dg=\operatorname{rev\_cumsum}(d\gamma)$。
+""".strip()))
+
+cells.append(code(r"""
+# 手推 GDN v1 chunk backward，用 autograd 逐位钉死。GDN v1 = KDA 把门控退化为 per-head 标量 g，
+# 故 dg 是每 head 每步一个标量（沿通道求和）。三块反向：① 块内 ② 块间 BPTT 扫描 ③ WY 求逆梯度。
+dev = "cuda"
+B_, H_, T_, D_, C_ = 1, 1, 12, 4, 4
+N_ = T_ // C_
+eye = torch.eye(C_, device=dev)
+strict = torch.triu(torch.ones(C_, C_, device=dev), 1).bool()      # 严格上三角（A 要置 0）
+incl = torch.triu(torch.ones(C_, C_, device=dev), 0).bool()        # 含对角上三角（L 要置 0）
+
+def fwd(q, k, v, g, beta, store):
+    qc, kc, vc = (x.view(B_, H_, N_, C_, -1) for x in (q, k, v)); gc = g.view(B_, H_, N_, C_); bc = beta.view(B_, H_, N_, C_)
+    o = torch.zeros(B_, H_, N_, C_, D_, device=dev); S = torch.zeros(B_, H_, D_, D_, device=dev)
+    for n in range(N_):
+        qn, kn, vn, gn, bn = qc[:, :, n], kc[:, :, n], vc[:, :, n], gc[:, :, n], bc[:, :, n]
+        gam = gn.cumsum(-1); E = gam.exp(); Ei = (-gam).exp(); glast = gam[..., -1]        # 标量 g^cum 前缀和
+        hk = kn * E[..., None]; kbar = kn * Ei[..., None]; hq = qn * E[..., None]
+        P = hk @ kbar.transpose(-1, -2)
+        L = (bn[..., :, None] * P).masked_fill(incl, 0.)                                   # L_ij=β_i(k_i·k_j)e^{g_i-g_j}
+        Tn = torch.linalg.inv(eye + L)                                                     # WY 求逆 T=(I+L)^{-1}
+        vb = bn[..., None] * vn; kb = bn[..., None] * hk
+        U = Tn @ vb; W = Tn @ kb
+        A = (hq @ kbar.transpose(-1, -2)).masked_fill(strict, 0.)
+        uh = U - W @ S
+        o[:, :, n] = hq @ S + A @ uh
+        Ktail = kn * (glast[..., None] - gam).exp()[..., None]
+        store.append(dict(gam=gam, E=E, Ei=Ei, glast=glast, bn=bn, hk=hk, kbar=kbar, hq=hq, P=P,
+                          Tn=Tn, vb=vb, kb=kb, W=W, A=A, uh=uh, Sn=S.clone(), Ktail=Ktail, qn=qn, kn=kn, vn=vn))
+        S = E[..., -1][..., None, None] * S + Ktail.transpose(-1, -2) @ uh
+    return o.view(B_, H_, T_, D_)
+
+def bwd(do, store):
+    doc = do.view(B_, H_, N_, C_, D_)
+    dq = torch.zeros(B_, H_, N_, C_, D_, device=dev); dk = torch.zeros_like(dq); dv = torch.zeros_like(dq)
+    dg = torch.zeros(B_, H_, N_, C_, device=dev); dbeta = torch.zeros(B_, H_, N_, C_, device=dev); dS = torch.zeros(B_, H_, D_, D_, device=dev)
+    for n in reversed(range(N_)):
+        s = store[n]
+        gam, E, Ei, glast, bn, hk, kbar, hq, P, Tn, vb, kb, W, A, uh, Sn, Ktail, qn, kn, vn = (s[x] for x in
+            ("gam", "E", "Ei", "glast", "bn", "hk", "kbar", "hq", "P", "Tn", "vb", "kb", "W", "A", "uh", "Sn", "Ktail", "qn", "kn", "vn"))
+        do_n = doc[:, :, n]; dgam = torch.zeros_like(gam)
+        dhk = torch.zeros_like(kn); dkbar = torch.zeros_like(kn); dhq = torch.zeros_like(qn)
+        El = E[..., -1]                                                                    # ② 块间 BPTT 反向扫描
+        dS_state = El[..., None, None] * dS; dEl = (Sn * dS).sum((-1, -2))
+        dKtail = uh @ dS.transpose(-1, -2); duh = Ktail @ dS
+        dglast = dEl * El; dk[:, :, n] = dKtail * (glast[..., None] - gam).exp()[..., None]
+        tmp = dKtail * Ktail; dglast = dglast + tmp.sum((-1, -2)); dgam = dgam - tmp.sum(-1)
+        dhq = dhq + do_n @ Sn.transpose(-1, -2); dS_state = dS_state + hq.transpose(-1, -2) @ do_n   # ① 块内
+        dA = do_n @ uh.transpose(-1, -2); duh = duh + A.transpose(-1, -2) @ do_n
+        dU = duh; dW = -duh @ Sn.transpose(-1, -2); dS_state = dS_state - W.transpose(-1, -2) @ duh   # ũ=U-WS
+        dAm = dA.masked_fill(strict, 0.); dhq = dhq + dAm @ kbar; dkbar = dkbar + dAm.transpose(-1, -2) @ hq
+        dTn = dU @ vb.transpose(-1, -2) + dW @ kb.transpose(-1, -2)                         # ③ U=T(βv), W=T(β·k̂)
+        dvb = Tn.transpose(-1, -2) @ dU; dkb = Tn.transpose(-1, -2) @ dW
+        dv[:, :, n] = dvb * bn[..., None]; dbeta[:, :, n] = (dvb * vn).sum(-1) + (dkb * hk).sum(-1)
+        dhk = dhk + dkb * bn[..., None]
+        dL = (-Tn.transpose(-1, -2) @ dTn @ Tn.transpose(-1, -2)).masked_fill(incl, 0.)     # ③ 矩阵求逆梯度
+        dP = dL * bn[..., :, None]; dbeta[:, :, n] = dbeta[:, :, n] + (dL * P).sum(-1)
+        dhk = dhk + dP @ kbar; dkbar = dkbar + dP.transpose(-1, -2) @ hk
+        dk[:, :, n] = dk[:, :, n] + dhk * E[..., None] + dkbar * Ei[..., None]
+        dgam = dgam + (dhk * hk).sum(-1) - (dkbar * kbar).sum(-1)                           # 标量 g：沿通道求和
+        dq[:, :, n] = dhq * E[..., None]; dgam = dgam + (dhq * hq).sum(-1)
+        dgam[..., -1] = dgam[..., -1] + dglast
+        dg[:, :, n] = dgam.flip(-1).cumsum(-1).flip(-1)                                     # 前缀和反向 = 后缀和
+        dS = dS_state
+    return (x.reshape(B_, H_, T_, D_) for x in (dq, dk, dv)), dg.reshape(B_, H_, T_), dbeta.reshape(B_, H_, T_)
+
+torch.manual_seed(0)
+q = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True); k = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True)
+v = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True); g = F.logsigmoid(torch.randn(B_, H_, T_, device=dev)).requires_grad_(True)
+beta = torch.rand(B_, H_, T_, device=dev, requires_grad=True)
+store = []; o = fwd(q, k, v, g, beta, store); do = torch.randn_like(o); o.backward(do)
+o_rec = gated_delta_recurrent(q, k, v, g, beta, l2norm=False, scale=1.0)
+print(f"可微 chunk fwd vs gated_delta_recurrent   max diff = {(o.detach() - o_rec).abs().max().item():.2e}")
+(dq_m, dk_m, dv_m), dg_m, db_m = bwd(do, store)
+for nm, a, b in [("dq", dq_m, q.grad), ("dk", dk_m, k.grad), ("dv", dv_m, v.grad), ("dg", dg_m, g.grad), ("dβ", db_m, beta.grad)]:
+    print(f"{nm}: 手推 vs autograd  max diff = {(a - b).abs().max().item():.2e}")
+print("→ GDN v1 手推 backward（① 块内 ② 块间 BPTT 扫描 ③ WY 求逆梯度 + 标量门控 dg）与 autograd 逐位一致。")
+""".strip()))
+
+cells.append(md(r"""
+### 8.2 GDN-2 的增量：erase / write 双门梯度
+
+GDN-2 把单 $\beta$ 换成 **erase 门 $b\in\mathbb R^K$**（折进 key：$\widehat{bk}=(b\odot k)\odot e^{\gamma}$）和
+**write 门 $w\in\mathbb R^V$**（折进 value：$w\odot v$），门控 $g$ 是 per-channel。于是 WY 三量变成
+
+$$L_n=\operatorname{strict\_tril}(\widehat{bk}\,\bar K^\top),\qquad U=T_n(w\odot v),\qquad W=T_n\,\widehat{bk}\qquad(\text{无 }\beta).$$
+
+反向的**三块结构（块内 / BPTT / WY 求逆）完全不变**，只是链尾不同：$U=T_n(w\odot v)$ 反传出 $dw=dU'\odot v$（其中 $dU'=T_n^\top dU$）；
+$\widehat{bk}=(b\odot k)\odot e^{\gamma}$ 反传出 $db=d(bk)\odot k$。**少了 $d\beta$，多了 $db,dw$**，$dg$ 仍是 per-channel。
+""".strip()))
+
+cells.append(code(r"""
+# 手推 GDN-2 chunk backward，用 autograd 逐位钉死。相对 GDN v1/KDA：去掉单 β，换成 erase 门 b∈R^K（折进 k̂）
+# 与 write 门 w∈R^V（折进 v）→ 反向多出 db、dw，少了 dβ。其余三块结构（块内/BPTT/WY 求逆）不变。
+dev = "cuda"
+B_, H_, T_, D_, C_ = 1, 1, 12, 4, 4
+N_ = T_ // C_
+eye = torch.eye(C_, device=dev)
+strict = torch.triu(torch.ones(C_, C_, device=dev), 1).bool()
+incl = torch.triu(torch.ones(C_, C_, device=dev), 0).bool()
+
+def fwd(q, k, v, g, b, w, store):
+    qc, kc, vc, gc, bgate, wgate = (x.view(B_, H_, N_, C_, -1) for x in (q, k, v, g, b, w))
+    o = torch.zeros(B_, H_, N_, C_, D_, device=dev); S = torch.zeros(B_, H_, D_, D_, device=dev)
+    for n in range(N_):
+        qn, kn, vn, gn, bn, wn = qc[:, :, n], kc[:, :, n], vc[:, :, n], gc[:, :, n], bgate[:, :, n], wgate[:, :, n]
+        gam = gn.cumsum(-2); E = gam.exp(); Ei = (-gam).exp(); glast = gam[..., -1, :]      # per-channel g^cum
+        bk = bn * kn; hbk = bk * E; kbar = kn * Ei; hq = qn * E                             # erase 门折进 k̂
+        L = (hbk @ kbar.transpose(-1, -2)).masked_fill(incl, 0.)                            # L_ij=(b_i k_i)·k_j e^{g_i-g_j}（无 β）
+        Tn = torch.linalg.inv(eye + L)
+        wv = wn * vn                                                                        # write 门折进 v
+        U = Tn @ wv; W = Tn @ hbk
+        A = (hq @ kbar.transpose(-1, -2)).masked_fill(strict, 0.)
+        uh = U - W @ S
+        o[:, :, n] = hq @ S + A @ uh
+        Ktail = kn * (glast[..., None, :] - gam).exp()
+        store.append(dict(gam=gam, E=E, Ei=Ei, glast=glast, bn=bn, wn=wn, bk=bk, hbk=hbk, kbar=kbar, hq=hq,
+                          Tn=Tn, wv=wv, W=W, A=A, uh=uh, Sn=S.clone(), Ktail=Ktail, qn=qn, kn=kn, vn=vn))
+        S = E[..., -1, :][..., None] * S + Ktail.transpose(-1, -2) @ uh
+    return o.view(B_, H_, T_, D_)
+
+def bwd(do, store):
+    doc = do.view(B_, H_, N_, C_, D_)
+    dq = torch.zeros(B_, H_, N_, C_, D_, device=dev); dk = torch.zeros_like(dq); dv = torch.zeros_like(dq)
+    dg = torch.zeros_like(dq); db = torch.zeros_like(dq); dw = torch.zeros_like(dq); dS = torch.zeros(B_, H_, D_, D_, device=dev)
+    for n in reversed(range(N_)):
+        s = store[n]
+        gam, E, Ei, glast, bn, wn, bk, hbk, kbar, hq, Tn, wv, W, A, uh, Sn, Ktail, qn, kn, vn = (s[x] for x in
+            ("gam", "E", "Ei", "glast", "bn", "wn", "bk", "hbk", "kbar", "hq", "Tn", "wv", "W", "A", "uh", "Sn", "Ktail", "qn", "kn", "vn"))
+        do_n = doc[:, :, n]; dgam = torch.zeros_like(gam)
+        dhbk = torch.zeros_like(kn); dkbar = torch.zeros_like(kn); dhq = torch.zeros_like(qn)
+        El = E[..., -1, :]                                                                  # ② 块间 BPTT 反向扫描
+        dS_state = El[..., None] * dS; dEl = (Sn * dS).sum(-1)
+        dKtail = uh @ dS.transpose(-1, -2); duh = Ktail @ dS
+        dglast = dEl * El; dk[:, :, n] = dKtail * (glast[..., None, :] - gam).exp()
+        tmp = dKtail * Ktail; dglast = dglast + tmp.sum(-2); dgam = dgam - tmp
+        dhq = dhq + do_n @ Sn.transpose(-1, -2); dS_state = dS_state + hq.transpose(-1, -2) @ do_n   # ① 块内
+        dA = do_n @ uh.transpose(-1, -2); duh = duh + A.transpose(-1, -2) @ do_n
+        dU = duh; dW = -duh @ Sn.transpose(-1, -2); dS_state = dS_state - W.transpose(-1, -2) @ duh   # ũ=U-WS
+        dAm = dA.masked_fill(strict, 0.); dhq = dhq + dAm @ kbar; dkbar = dkbar + dAm.transpose(-1, -2) @ hq
+        dTn = dU @ wv.transpose(-1, -2) + dW @ hbk.transpose(-1, -2)                        # ③ U=T(w∘v), W=T·(b∘k̂)
+        dwv = Tn.transpose(-1, -2) @ dU; dhbk = dhbk + Tn.transpose(-1, -2) @ dW
+        dw[:, :, n] = dwv * vn; dv[:, :, n] = dwv * wn                                      # write 门梯度 dw
+        dL = (-Tn.transpose(-1, -2) @ dTn @ Tn.transpose(-1, -2)).masked_fill(incl, 0.)     # ③ 矩阵求逆梯度（无 β）
+        dhbk = dhbk + dL @ kbar; dkbar = dkbar + dL.transpose(-1, -2) @ hbk
+        dbk = dhbk * E; dgam = dgam + dhbk * hbk                                            # hbk=(b∘k)∘e^{g^cum}
+        db[:, :, n] = dbk * kn; dk[:, :, n] = dk[:, :, n] + dbk * bn                        # erase 门梯度 db
+        dk[:, :, n] = dk[:, :, n] + dkbar * Ei; dgam = dgam - dkbar * kbar
+        dq[:, :, n] = dhq * E; dgam = dgam + dhq * hq
+        dgam[..., -1, :] = dgam[..., -1, :] + dglast
+        dg[:, :, n] = dgam.flip(-2).cumsum(-2).flip(-2)                                     # 前缀和反向 = 后缀和
+        dS = dS_state
+    return (x.reshape(B_, H_, T_, D_) for x in (dq, dk, dv, dg, db, dw))
+
+torch.manual_seed(0)
+q = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True); k = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True)
+v = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True); g = F.logsigmoid(torch.randn(B_, H_, T_, D_, device=dev)).requires_grad_(True)
+b = torch.rand(B_, H_, T_, D_, device=dev, requires_grad=True); w = torch.rand(B_, H_, T_, D_, device=dev, requires_grad=True)
+store = []; o = fwd(q, k, v, g, b, w, store); do = torch.randn_like(o); o.backward(do)
+o_rec = gdn2_recurrent(q, k, v, g, b, w, l2norm=False, scale=1.0)
+print(f"可微 chunk fwd vs gdn2_recurrent     max diff = {(o.detach() - o_rec).abs().max().item():.2e}")
+dq_m, dk_m, dv_m, dg_m, db_m, dw_m = bwd(do, store)
+for nm, a, bb in [("dq", dq_m, q.grad), ("dk", dk_m, k.grad), ("dv", dv_m, v.grad),
+                  ("dg", dg_m, g.grad), ("db", db_m, b.grad), ("dw", dw_m, w.grad)]:
+    print(f"{nm}: 手推 vs autograd  max diff = {(a - bb).abs().max().item():.2e}")
+print("→ GDN-2 手推 backward（① 块内 ② 块间 BPTT 扫描 ③ WY 求逆梯度 + 双门 db/dw + per-channel dg）与 autograd 逐位一致。")
+""".strip()))
+
+cells.append(md(r"""
+### 8.3 对应到真实 kernel
+
+GDN / GDN-2 把 backward 拆成几个 kernel（见 §7 完整源码里的 `*_bwd`）：
+
+| 手推的反向 | GDN v1 | GDN-2 |
+|---|---|---|
+| ② 块间反向扫描（$dS$、$du$） | `_fla_gdn_chunk_delta_h.py :: chunk_gated_delta_rule_bwd_dhu` | `_fla_gdn2_chunk.py :: chunk_gdn2_bwd`（编排） |
+| ① 块内 $dq/dk/dw/dg$ 与 $dv$ | `_fla_gdn_chunk_o.py :: chunk_bwd_dqkwg / chunk_bwd_dv` | `_fla_gdn2_chunk_intra.py :: chunk_gdn2_bwd_intra` |
+| ③ WY 求逆梯度 | `_fla_gdn_wy_fast.py :: *_bwd` | `_fla_gdn2_wy_fast.py :: *wy_dqkg` |
+| 门控 $dg$（GDN-2 再 + $db,dw$） | 前缀和反向 + gate bwd | 前缀和反向 + 双门 gate bwd |
+
+**这套 backward（BPTT 扫描 + WY 求逆梯度 + 门控/双门梯度）是 11→12→13 一脉相承的**：DeltaNet 是无门控原型，KDA/GDN
+加 per-channel/标量 $dg$，GDN-2 再把单 $\beta$ 的梯度拆成 $db,dw$ 两个门。
+""".strip()))
+
+# ============================ 9. §9 bench ============================
+cells.append(md(r"""
+## 9. 复杂度：$O(S)$ vs full attention $O(S^2)$
 
 GDN/GDN-2 都是线性复杂度。GDN-2 多了 per-channel 双门控，每步常数更大（略慢于 GDN），交叉点更靠后。
 """.strip()))
@@ -577,7 +790,7 @@ for i, S in enumerate(Ss):
 
 # ============================ 10. 收尾 ============================
 cells.append(md(r"""
-## 9. 收尾
+## 10. 收尾
 
 这一章把 gated delta rule 推到了生产形态，关键脉络：
 
@@ -586,7 +799,8 @@ cells.append(md(r"""
 3. **erase/write 解耦**（§4）：GDN-2 把单 $\beta$ 拆成 per-channel 的 $b,w$ 两个门，表达力更强；
 4. **WY 表示**（§5）：把块内串行擦除写成 $(I+T)U=WV$，一次三角求逆解开，是 chunk 并行的地基；
 5. **逐段精读 + 真实 kernel**（§6–§7）：可读参考实现的每一段都对应一条公式与一处 Triton kernel，本仓库
-   完整解耦自 fla，与原版 bitwise 一致。
+   完整解耦自 fla，与原版 bitwise 一致；
+6. **反向传播**（§8）：GDN v1 与 GDN-2 两个变体都手推了 backward（块内 + 块间 BPTT 扫描 + WY 求逆梯度 + 门控/双门 $dg,db,dw$），与 autograd 逐位钉死。
 
 退化链 $\textbf{DeltaNet}\to\textbf{KDA}\to\textbf{GDN v1}\to\textbf{GDN-2}$ 我们逐节做了数值验证。线性注意力线
 （10 GLA → 11 DeltaNet → 12 KDA → 13 GDN/GDN-2）到此完成；下一章转向 **DeepSeek V4** 的混合压缩稀疏注意力。

@@ -307,9 +307,142 @@ print(f"③ 本地 chunk vs 简要版 recurrent   max diff: {(ol.float()-o_rec.f
 print("→ 完整解耦（14 文件 + cp stub）没改任何计算：与 fla 数值一致、与 recurrent ground truth 对齐。")
 """.strip()))
 
-# ============================ 8. §7 bench ============================
+# ============================ 7.5 §7 反向传播 ============================
 cells.append(md(r"""
-## 7. 复杂度：$O(S)$ vs full attention $O(S^2)$
+## 7. 反向传播：梯度怎么流过 gated chunk
+
+§1–§6 都在讲 forward；训练靠 backward。KDA 的 `chunk_bwd` 在 DeltaNet（第 11 章 §6）的反向之上，多出一条
+**per-channel 门控梯度 $dg$**。难点仍是那两处，再加门控：
+
+1. 状态 $S$ 在块间**串行 carry** → backward 必须**反向扫描**（BPTT，从后往前累积状态梯度 $dS$）；
+2. WY 表示里有**矩阵求逆** $T=(I+L)^{-1}$ → 它的反向是**矩阵求逆的梯度**，不是普通矩阵乘；
+3. 每块的 per-channel 衰减 $e^{g^{\mathrm{cum}}}$ 折进了 $\hat k,\bar k,\hat q,k_{\text{tail}}$ 与状态衰减，这些指数项的梯度都要**汇回 $dg$**（块内前缀和的反向是后缀和）。
+
+下面把它们推清楚，再手推**完整 backward** 用 autograd **逐位钉死**。
+""".strip()))
+
+cells.append(md(r"""
+### 7.1 三个关键反向（+ 门控）
+
+记 forward（块 $n$，$S$ 为进入该块的状态，$\gamma=g$ 的块内前缀和、per-channel）。把衰减折进
+$\hat k=k\odot e^{\gamma},\ \bar k=k\odot e^{-\gamma},\ \hat q=q\odot e^{\gamma}$，则
+
+$$L_n=\operatorname{strict\_tril}\!\big(\operatorname{diag}(\beta)\,\hat K\bar K^\top\big),\quad T_n=(I+L_n)^{-1},\quad U=T_n(\beta\odot v),\quad W=T_n(\beta\odot\hat k),\quad A_n=\operatorname{tril}(\hat Q\bar K^\top),$$
+$$\tilde u_n=U-WS,\qquad o_n=\hat Q\,S+A_n\tilde u_n,\qquad S'=\operatorname{diag}(e^{\gamma_{\text{last}}})\,S+k_{\text{tail}}^\top\tilde u_n,\quad k_{\text{tail}}=k\odot e^{\gamma_{\text{last}}-\gamma}.$$
+
+**① 块内（标准矩阵乘反向）**：由 $o_n=\hat Q S+A_n\tilde u_n$ 得 $d\hat Q\mathrel{+}=do_n\,S^\top$、$dA_n=do_n\,\tilde u_n^\top$、
+$d\tilde u_n\mathrel{+}=A_n^\top do_n$（$A_n$ 梯度 mask 回下三角）。
+
+**② 块间反向扫描（BPTT）**：$S'=\operatorname{diag}(e^{\gamma_{\text{last}}})S+k_{\text{tail}}^\top\tilde u_n$ 把状态梯度 $dS$ 从后往前传——
+
+$$dS\mathrel{+}=\operatorname{diag}(e^{\gamma_{\text{last}}})\,dS',\qquad dk_{\text{tail}}=\tilde u_n\,dS'^\top,\qquad d\tilde u_n\mathrel{+}=k_{\text{tail}}\,dS';$$
+
+再配 $\tilde u_n=U-WS$ 补 $dS\mathrel{-}=W^\top d\tilde u_n$。**从 $n=N{-}1$ 倒扫到 $0$**，$dS$ 一路累积——这正是 RNN 的 BPTT。
+
+**③ WY 求逆梯度**：$U=T_n(\beta\odot v),\ W=T_n(\beta\odot\hat k)$ 给出 $dT_n=dU\,(\beta\odot v)^\top+dW\,(\beta\odot\hat k)^\top$；再用
+**矩阵求逆梯度** $\big(Y=X^{-1}\Rightarrow dX=-Y^\top dY\,Y^\top\big)$：
+
+$$dL_n=\operatorname{strict\_tril}\!\big(-T_n^\top\,dT_n\,T_n^\top\big).$$
+
+**④ 门控梯度 $dg$**：$\hat k,\bar k,\hat q,k_{\text{tail}}$ 与状态衰减 $e^{\gamma_{\text{last}}}$ 里每个 $e^{\pm\gamma}$ 都把梯度汇成 $d\gamma$，
+最后 $dg=\operatorname{rev\_cumsum}(d\gamma)$（前缀和的反向 = 后缀和）。这是 KDA 相对 DeltaNet 唯一多出来的一条链。
+""".strip()))
+
+cells.append(code(r"""
+# 手推 KDA chunk backward，用 autograd 逐位钉死（小尺寸显式分块；scale/l2norm 是独立标准 bwd，这里聚焦 gated chunk 代数）
+dev = "cuda"
+B_, H_, T_, D_, C_ = 1, 1, 12, 4, 4
+N_ = T_ // C_
+eye = torch.eye(C_, device=dev)
+strict = torch.triu(torch.ones(C_, C_, device=dev), 1).bool()      # 严格上三角（A 要置 0）
+incl = torch.triu(torch.ones(C_, C_, device=dev), 0).bool()        # 含对角上三角（L 要置 0）
+
+def fwd(q, k, v, g, beta, store):
+    qc, kc, vc, gc = (x.view(B_, H_, N_, C_, -1) for x in (q, k, v, g)); bc = beta.view(B_, H_, N_, C_)
+    o = torch.zeros(B_, H_, N_, C_, D_, device=dev); S = torch.zeros(B_, H_, D_, D_, device=dev)
+    for n in range(N_):
+        qn, kn, vn, gn, bn = qc[:, :, n], kc[:, :, n], vc[:, :, n], gc[:, :, n], bc[:, :, n]
+        gam = gn.cumsum(-2); E = gam.exp(); Ei = (-gam).exp(); glast = gam[..., -1, :]   # g^cum 块内前缀和（per-channel）
+        hk = kn * E; kbar = kn * Ei; hq = qn * E                                          # 把衰减折进 k/q
+        P = hk @ kbar.transpose(-1, -2)
+        L = (bn[..., :, None] * P).masked_fill(incl, 0.)                                  # L_ij=β_i(k_i·k_j)e^{g_i-g_j} 严格下三角
+        Tn = torch.linalg.inv(eye + L)                                                    # WY 求逆 T=(I+L)^{-1}
+        vb = bn[..., None] * vn; kb = bn[..., None] * hk
+        U = Tn @ vb; W = Tn @ kb                                                          # U=T(βv), W=T(β·k̂)
+        A = (hq @ kbar.transpose(-1, -2)).masked_fill(strict, 0.)                         # 块内因果含衰减 QK^T
+        uh = U - W @ S
+        o[:, :, n] = hq @ S + A @ uh
+        Ktail = kn * (glast[..., None, :] - gam).exp()
+        store.append(dict(gam=gam, E=E, Ei=Ei, glast=glast, bn=bn, hk=hk, kbar=kbar, hq=hq, P=P,
+                          Tn=Tn, vb=vb, kb=kb, W=W, A=A, uh=uh, Sn=S.clone(), Ktail=Ktail, qn=qn, kn=kn, vn=vn))
+        S = E[..., -1, :][..., None] * S + Ktail.transpose(-1, -2) @ uh
+    return o.view(B_, H_, T_, D_)
+
+def bwd(do, store):
+    doc = do.view(B_, H_, N_, C_, D_)
+    dq = torch.zeros(B_, H_, N_, C_, D_, device=dev); dk = torch.zeros_like(dq); dv = torch.zeros_like(dq)
+    dg = torch.zeros_like(dq); dbeta = torch.zeros(B_, H_, N_, C_, device=dev); dS = torch.zeros(B_, H_, D_, D_, device=dev)
+    for n in reversed(range(N_)):
+        s = store[n]
+        gam, E, Ei, glast, bn, hk, kbar, hq, P, Tn, vb, kb, W, A, uh, Sn, Ktail, qn, kn, vn = (s[x] for x in
+            ("gam", "E", "Ei", "glast", "bn", "hk", "kbar", "hq", "P", "Tn", "vb", "kb", "W", "A", "uh", "Sn", "Ktail", "qn", "kn", "vn"))
+        do_n = doc[:, :, n]; dgam = torch.zeros_like(gam)
+        dhk = torch.zeros_like(kn); dkbar = torch.zeros_like(kn); dhq = torch.zeros_like(qn)
+        El = E[..., -1, :]                                                                # ② 块间 BPTT 反向扫描
+        dS_state = El[..., None] * dS; dEl = (Sn * dS).sum(-1)
+        dKtail = uh @ dS.transpose(-1, -2); duh = Ktail @ dS
+        dglast = dEl * El; dk[:, :, n] = dKtail * (glast[..., None, :] - gam).exp()
+        tmp = dKtail * Ktail; dglast = dglast + tmp.sum(-2); dgam = dgam - tmp
+        dhq = dhq + do_n @ Sn.transpose(-1, -2); dS_state = dS_state + hq.transpose(-1, -2) @ do_n   # ① 块内
+        dA = do_n @ uh.transpose(-1, -2); duh = duh + A.transpose(-1, -2) @ do_n
+        dU = duh; dW = -duh @ Sn.transpose(-1, -2); dS_state = dS_state - W.transpose(-1, -2) @ duh   # ũ=U-WS
+        dAm = dA.masked_fill(strict, 0.); dhq = dhq + dAm @ kbar; dkbar = dkbar + dAm.transpose(-1, -2) @ hq
+        dTn = dU @ vb.transpose(-1, -2) + dW @ kb.transpose(-1, -2)                        # ③ U=T(βv), W=T(β·k̂)
+        dvb = Tn.transpose(-1, -2) @ dU; dkb = Tn.transpose(-1, -2) @ dW
+        dv[:, :, n] = dvb * bn[..., None]; dbeta[:, :, n] = (dvb * vn).sum(-1) + (dkb * hk).sum(-1)
+        dhk = dhk + dkb * bn[..., None]
+        dL = (-Tn.transpose(-1, -2) @ dTn @ Tn.transpose(-1, -2)).masked_fill(incl, 0.)    # ③ 矩阵求逆梯度
+        dP = dL * bn[..., :, None]; dbeta[:, :, n] = dbeta[:, :, n] + (dL * P).sum(-1)
+        dhk = dhk + dP @ kbar; dkbar = dkbar + dP.transpose(-1, -2) @ hk
+        dk[:, :, n] = dk[:, :, n] + dhk * E + dkbar * Ei; dgam = dgam + dhk * hk - dkbar * kbar   # ④ e^{±g^cum} 汇回 dg
+        dq[:, :, n] = dhq * E; dgam = dgam + dhq * hq
+        dgam[..., -1, :] = dgam[..., -1, :] + dglast
+        dg[:, :, n] = dgam.flip(-2).cumsum(-2).flip(-2)                                    # 前缀和的反向 = 后缀和
+        dS = dS_state
+    return (x.reshape(B_, H_, T_, D_) for x in (dq, dk, dv, dg)), dbeta.reshape(B_, H_, T_)
+
+torch.manual_seed(0)
+q = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True); k = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True)
+v = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True); g = F.logsigmoid(torch.randn(B_, H_, T_, D_, device=dev)).requires_grad_(True)
+beta = torch.rand(B_, H_, T_, device=dev, requires_grad=True)
+store = []; o = fwd(q, k, v, g, beta, store); do = torch.randn_like(o); o.backward(do)
+o_rec = kda_recurrent(q, k, v, g, beta, l2norm=False, scale=1.0)
+print(f"可微 chunk fwd vs kda_recurrent      max diff = {(o.detach() - o_rec).abs().max().item():.2e}")
+(dq_m, dk_m, dv_m, dg_m), db_m = bwd(do, store)
+for nm, a, b in [("dq", dq_m, q.grad), ("dk", dk_m, k.grad), ("dv", dv_m, v.grad), ("dg", dg_m, g.grad), ("dβ", db_m, beta.grad)]:
+    print(f"{nm}: 手推 vs autograd  max diff = {(a - b).abs().max().item():.2e}")
+print("→ 手推 backward（块间 BPTT 反向扫描 + WY 求逆梯度 + 块内 + per-channel 门控 dg）与 autograd 逐位一致。")
+""".strip()))
+
+cells.append(md(r"""
+### 7.2 对应到真实 kernel
+
+这几块正是 fla 把 KDA backward 拆成多个 kernel 的原因（见 §6 完整源码里的 `*_bwd`）：
+
+| 手推的反向 | fla bwd kernel |
+|---|---|
+| ② 块间反向扫描（$dS$、$du$） | `_fla_kda_chunk_delta_h.py :: chunk_gated_delta_rule_bwd_dhu` |
+| ① 块内 $dq/dk/dg$ 与 $dv$（复用 GLA） | `_fla_kda_gla_chunk.py :: chunk_gla_bwd_dqkg / chunk_gla_bwd_dv` |
+| ③ WY 求逆梯度（$dL$、$dv^\beta$、$dk^\beta$） | `_fla_kda_wy_fast.py :: *_bwd` |
+| ④ per-channel 门控梯度 $dg$ | `_fla_kda_cumsum.py`（前缀和反向）+ kda gate bwd |
+
+**这套 backward 结构（BPTT 扫描 + WY 求逆梯度 + 门控 $dg$）是 11→12→13 一脉相承的**——KDA 只是把 DeltaNet 的反向加上了
+per-channel 门控这一条 $dg$ 链。读懂它，`_fla_kda_chunk.py` 里把这些 kernel 串起来的 `chunk_kda_bwd` 编排你也能跟下来。
+""".strip()))
+
+# ============================ 8. §8 bench ============================
+cells.append(md(r"""
+## 8. 复杂度：$O(S)$ vs full attention $O(S^2)$
 
 KDA 每步比 GLA/DeltaNet 更重（门控衰减 + delta 纠错都做），常数更大，但复杂度仍线性，长序列优于 full attention。
 """.strip()))
@@ -343,14 +476,15 @@ for i, S in enumerate(Ss):
 
 # ============================ 9. 收尾 ============================
 cells.append(md(r"""
-## 8. 收尾
+## 9. 收尾
 
 KDA 把线性注意力的"状态管理"做到了两全：
 
 1. **门控遗忘**（来自 GLA）：$\operatorname{diag}(e^{g_t})$ 按通道选择性遗忘，控制记忆窗口；
 2. **delta 纠错**（来自 DeltaNet）：$(I-\beta_t k_tk_t^\top)$ 沿 $k_t$ 擦除旧值再写新值，根治键冲突；
 3. **WY 表示**（§4）：把块内串行擦除写成 $(I+T)U=V$，一次三角求逆解开，是 chunk 并行的地基；
-4. **逐段精读 + 完整 kernel**（§5–§6）：可读参考实现的每段都对应公式与 Triton 位置，本仓库完整解耦自 fla、与原版数值一致。
+4. **逐段精读 + 完整 kernel**（§5–§6）：可读参考实现的每段都对应公式与 Triton 位置，本仓库完整解耦自 fla、与原版数值一致；
+5. **反向传播**（§7）：在 DeltaNet 反向（块间 BPTT 扫描 + WY 求逆梯度 + 块内）之上，多一条 per-channel 门控梯度 $dg$，手推已与 autograd 逐位钉死。
 
 退化链 $\textbf{KDA}\xrightarrow{g\equiv0}\textbf{DeltaNet}$ 已数值验证。**下一章** → 13-gated-deltanet：把 delta rule 的
 erase/write 进一步解耦成两个门（GDN/GDN-2，Qwen3-Next/3.5）。
