@@ -29,14 +29,17 @@
 
 ## 学习路线图
 
-主线（参考 [`lecture.md`](./lecture.md)）：
+> 📍 **新人先看 [`OVERVIEW.md`](./OVERVIEW.md)** —— 一页地图：15 个变体的"状态更新公式"对比大表、统一符号表、
+> 难度标注（⭐）与章节依赖 DAG。下面是四条主线的速览（详细对比见 OVERVIEW，背景见 [`lecture.md`](./lecture.md)）：
 
 ```
-基础线   vanilla → online softmax → FlashAttention v1/v2 → GQA/MQA → sliding window → paged
-稀疏线   Native Sparse Attention (NSA) → Dynamic Sparse (DSA) → DashAttention
-线性线   Linear Attention → GLA → DeltaNet → Gated DeltaNet → KDA
-推理线   KV cache → MLA → Paged Attention → FlashInfer 风格接口
+基础线    vanilla → online softmax → FlashAttention → GQA/MQA → sliding window
+推理线    paged（分页 KV cache）→ MLA（低秩 KV 压缩 + absorb）
+稀疏线    block-sparse（top-k 选块）→ NSA（压缩+选择+滑窗三分支）→ DeepSeek V4（CSA+HCA 压缩稀疏）
+线性/SSM  linear → GLA → DeltaNet → KDA → GDN/GDN-2 ；  并行一支：Mamba2 SSD（= 标量衰减 GLA）
 ```
+
+> 早期规划里的 DSA / DashAttention / FlashInfer 接口暂未纳入；当前 15 章的真实状态以下表为准。
 
 ### 变体清单与状态
 
@@ -66,14 +69,20 @@
 
 ```
 NN-variant-name/
-├── README.md          # 文档：数学原理、算法推导、kernel 结构讲解、参考来源
-├── reference.py       # 纯 PyTorch 参考实现（ground truth，可读优先）；通用部分复用 common/
-├── <variant>.py       # 优化实现：拷贝来的 Triton kernel + 调用胶水（文件头标注来源）
-├── SOURCES.md         # 该变体所有外部拷贝代码的来源、commit、license 登记
-├── test_<variant>.py  # pytest：优化实现 vs 参考实现 / SDPA 的数值一致性（fwd + bwd）
-├── bench.py           # 基准：延迟 / 显存 / TFLOP-s 对比
-└── <variant>.ipynb    # 最终呈现：分步讲解 + 每步测试输入与示范输出 + 可视化
+├── README.md            # 数学原理、算法推导、kernel 结构讲解、来源
+├── <name>.py            # 自写简要版 / ground truth（纯 PyTorch，可读优先）
+├── <name>_triton.py     # 深度优化版入口：封装下方解耦出来的真实 kernel
+├── _fla_*.py            # 拷贝并「完整解耦」的真实 triton kernel（文件头标 provenance；线性/SSM 线）
+├── <name>_naive.py      # 外部参考实现（notebook 里拆段精读的对象）
+├── SOURCES.md           # 外部拷贝代码的来源 / commit / license 登记
+├── test_*.py            # pytest：解耦 kernel ≡ 原版（bitwise）+ ≡ recurrent + fwd/bwd
+├── bench.py             # 基准：延迟 / 显存 / TFLOP-s
+└── <name>.ipynb         # 数学深入 notebook：推导 + 拆段精读 + 完整源码 + 可视化
 ```
+
+> 两种模式：**基础/推理线（01–06）** 多为「自写参考 + 外部 prefill/decode kernel」；**线性/SSM 线（10–15）** 是
+> 「自写 recurrent 简要版 + 从 fla **完整解耦** chunk kernel（`_fla_*` + 薄适配层 `_fla_*_compat.py`）」。
+> **自写机制章（01/04/07/14、Mamba1）** 无可提取 kernel，拆段精读对象是自写实现本身 + 指向官方来源。
 
 公共工具在 [`common/`](./common/)：
 

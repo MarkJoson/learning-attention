@@ -283,9 +283,123 @@ print(f"③ 本地 chunk vs 简要版 recurrent   max diff: {(ol.float()-o_rec.f
 print("→ 完整解耦（8 文件 + no-op dispatch）没改任何计算：与 fla 数值一致、与 recurrent ground truth 对齐。")
 """.strip()))
 
-# ============================ 7. §6 bench ============================
+# ============================ 6.5 §6 反向传播 ============================
 cells.append(md(r"""
-## 6. 复杂度：$O(S)$ vs full attention $O(S^2)$
+## 6. 反向传播：梯度怎么流过 chunk-parallel
+
+前面 §1–§5 都在讲 forward。但训练靠 backward，而 DeltaNet 的 `chunk_bwd` kernel 往往比 forward 还大——**反向才是
+kernel 的另一半精华**。它难在两点，都不是"链式法则套一下"那么简单：
+
+1. **状态 $S$ 在块间串行 carry**（forward 从 chunk 0 累积到 $N$）→ backward 必须**反向扫描**（BPTT，从后往前累积状态
+   梯度 $dS$）；
+2. **WY 表示里有个矩阵求逆** $T=(I+L)^{-1}$ → 它的反向是**矩阵求逆的梯度**，不是普通矩阵乘。
+
+下面把这两块推清楚，再手推**完整 backward** 并用 autograd **逐位钉死**。
+""".strip()))
+
+cells.append(md(r"""
+### 6.1 三个关键反向
+
+记 forward（块 $n$，$S_n$ 是进入该块的状态）：
+
+$$\tilde u_n=u_n-w_nS_n,\qquad o_n=q_nS_n+A_n\tilde u_n,\qquad S_{n+1}=S_n+k_n^\top\tilde u_n,$$
+
+其中 $u_n=T_nv^\beta_n,\ w_n=T_nk^\beta_n,\ T_n=(I+L_n)^{-1},\ L_n=\operatorname{strict\_tril}(k^\beta_nk_n^\top),\ A_n=\operatorname{tril}(q_nk_n^\top)$。
+
+**① 块内（标准矩阵乘反向）**：由 $o_n=q_nS_n+A_n\tilde u_n$ 得 $dq_n\mathrel{+}=do_n S_n^\top$、$dA_n=do_n\tilde u_n^\top$、
+$d\tilde u_n\mathrel{+}=A_n^\top do_n$，其中 $A_n$ 的梯度要 mask 回下三角。
+
+**② 块间反向扫描（BPTT）**：$S_{n+1}=S_n+k_n^\top\tilde u_n$ 把状态梯度 $dS$ 从后往前传——
+
+$$dS_n\mathrel{+}=dS_{n+1},\qquad d\tilde u_n\mathrel{+}=k_n\,dS_{n+1},\qquad dk_n\mathrel{+}=\tilde u_n\,dS_{n+1}^\top.$$
+
+配合 $\tilde u_n=u_n-w_nS_n$ 再补 $dS_n\mathrel{-}=w_n^\top d\tilde u_n$。**从 $n=N{-}1$ 倒扫到 $0$**，$dS$ 一路累积——这正是 RNN 的 BPTT。
+
+**③ WY 求逆的梯度**：$u_n=T_nv^\beta_n,\ w_n=T_nk^\beta_n$ 给出 $dT_n=du_n(v^\beta_n)^\top+dw_n(k^\beta_n)^\top$。再用
+**矩阵求逆梯度** $\big(Y=X^{-1}\Rightarrow dX=-Y^\top\,dY\,Y^\top\big)$：
+
+$$dL_n=\operatorname{strict\_tril}\!\big(-T_n^\top\,dT_n\,T_n^\top\big).$$
+
+最后 $L_n=\operatorname{strict\_tril}(k^\beta_nk_n^\top)$ 反传出 $dk^\beta_n,dk_n$；$v^\beta=\beta\odot v,\ k^\beta=\beta\odot k$ 再反传出 $dv,d\beta,dk$。
+""".strip()))
+
+cells.append(code(r"""
+# 手推 chunk backward，并用 autograd 逐位钉死（小尺寸、显式分块；scale/l2norm 是独立的标准 bwd，这里聚焦 chunk 代数）
+dev = "cuda"
+B_, H_, T_, D_, C_ = 1, 1, 12, 4, 4
+N_ = T_ // C_
+eye = torch.eye(C_, device=dev)
+strict = torch.triu(torch.ones(C_, C_, device=dev), 1).bool()    # 严格上三角（A 要置 0 的部分）
+incl = torch.triu(torch.ones(C_, C_, device=dev), 0).bool()      # 含对角上三角（L 要置 0 的部分）
+
+def fwd(q, k, v, beta, store):
+    vb, kb = v * beta[..., None], k * beta[..., None]            # v^β, k^β
+    qc, kc, vbc, kbc = (x.view(B_, H_, N_, C_, -1) for x in (q, k, vb, kb))
+    o = torch.zeros(B_, H_, N_, C_, D_, device=dev); S = torch.zeros(B_, H_, D_, D_, device=dev)
+    for n in range(N_):
+        Ln = (kbc[:, :, n] @ kc[:, :, n].transpose(-1, -2)).masked_fill(incl, 0.)
+        Tn = torch.linalg.inv(eye + Ln); un = Tn @ vbc[:, :, n]; wn = Tn @ kbc[:, :, n]
+        An = (qc[:, :, n] @ kc[:, :, n].transpose(-1, -2)).masked_fill(strict, 0.)
+        uh = un - wn @ S
+        o[:, :, n] = qc[:, :, n] @ S + An @ uh
+        store.append(dict(Tn=Tn, wn=wn, An=An, Sn=S.clone(), uh=uh,
+                          qn=qc[:, :, n], kn=kc[:, :, n], vbn=vbc[:, :, n], kbn=kbc[:, :, n]))
+        S = S + kc[:, :, n].transpose(-1, -2) @ uh
+    return o.view(B_, H_, T_, D_)
+
+def bwd(do, store, k, v, beta):
+    doc = do.view(B_, H_, N_, C_, D_)
+    dq = torch.zeros(B_, H_, N_, C_, D_, device=dev); dk = torch.zeros_like(dq)
+    dvb = torch.zeros_like(dq); dkb = torch.zeros_like(dq)
+    dS = torch.zeros(B_, H_, D_, D_, device=dev)                  # 对 S_{n+1} 的梯度，反向累积
+    for n in reversed(range(N_)):
+        s = store[n]; Tn, wn, An, Sn, uh, qn, kn, vbn, kbn = (s[x] for x in ("Tn","wn","An","Sn","uh","qn","kn","vbn","kbn"))
+        do_n = doc[:, :, n]
+        dqn = do_n @ Sn.transpose(-1, -2); dSn = qn.transpose(-1, -2) @ do_n        # ① o = q_n S_n
+        dAn = do_n @ uh.transpose(-1, -2); duh = An.transpose(-1, -2) @ do_n        # ① o = A_n ũ_n
+        duh = duh + kn @ dS; dkn = uh @ dS.transpose(-1, -2); dSn = dSn + dS         # ② S_{n+1}=S_n+kᵀũ
+        dun = duh; dwn = -duh @ Sn.transpose(-1, -2); dSn = dSn - wn.transpose(-1, -2) @ duh  # ũ=u-wS
+        dA = dAn.masked_fill(strict, 0.); dqn = dqn + dA @ kn; dkn = dkn + dA.transpose(-1, -2) @ qn  # A=tril(qkᵀ)
+        dTn = dun @ vbn.transpose(-1, -2) + dwn @ kbn.transpose(-1, -2)             # ③ u=Tvᵝ, w=Tkᵝ
+        dvbn = Tn.transpose(-1, -2) @ dun; dkbn = Tn.transpose(-1, -2) @ dwn
+        dLn = (-Tn.transpose(-1, -2) @ dTn @ Tn.transpose(-1, -2)).masked_fill(incl, 0.)  # ③ T=(I+L)⁻¹ → dL=-TᵀdT·Tᵀ
+        dkbn = dkbn + dLn @ kn; dkn = dkn + dLn.transpose(-1, -2) @ kbn             # L=strict_tril(kᵝkᵀ)
+        dq[:, :, n] = dqn; dk[:, :, n] = dkn; dvb[:, :, n] = dvbn; dkb[:, :, n] = dkbn; dS = dSn
+    dq, dk, dvb, dkb = (x.reshape(B_, H_, T_, D_) for x in (dq, dk, dvb, dkb))
+    dv = dvb * beta[..., None]; dk = dk + dkb * beta[..., None]                     # v^β=βv, k^β=βk
+    dbeta = (dvb * v).sum(-1) + (dkb * k).sum(-1)
+    return dq, dk, dv, dbeta
+
+torch.manual_seed(0)
+q = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True); k = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True)
+v = torch.randn(B_, H_, T_, D_, device=dev, requires_grad=True); beta = torch.rand(B_, H_, T_, device=dev, requires_grad=True)
+store = []; o = fwd(q, k, v, beta, store); do = torch.randn_like(o); o.backward(do)
+dq_m, dk_m, dv_m, db_m = bwd(do, store, k, v, beta)
+for nm, a, b in [("dq", dq_m, q.grad), ("dk", dk_m, k.grad), ("dv", dv_m, v.grad), ("dβ", db_m, beta.grad)]:
+    print(f"{nm}: 手推 vs autograd  max diff = {(a - b).abs().max().item():.2e}")
+print("→ 手推 backward（块间反向扫描 + WY 求逆梯度 + 块内）与 autograd 逐位一致——这就是 fla chunk_bwd kernel 在算的东西。")
+""".strip()))
+
+cells.append(md(r"""
+### 6.2 对应到真实 kernel
+
+这三块正是 fla 把 backward 拆成几个 kernel 的原因（见 §5 完整源码里的 `*_bwd` 函数）：
+
+| 手推的反向 | fla bwd kernel |
+|---|---|
+| ② 块间反向扫描（$dS$、$du$） | `_fla_chunk_delta_h.py :: chunk_gated_delta_rule_bwd_dhu` |
+| ③ WY 求逆梯度（$dL$、$dv^\beta$、$dk^\beta$） | `_fla_wy_fast.py :: prepare_wy_repr_bwd` |
+| ① 块内 $dq/dk/dw$ 与 $dv$ | `_fla_chunk_o.py :: chunk_bwd_dqkwg / chunk_bwd_dv` |
+| L2norm 的反向 | `_fla_l2norm.py :: l2norm_bwd` |
+
+读懂这一节，`_fla_delta_chunk.py::chunk_delta_rule_bwd` 那段把它们串起来的编排你也能跟下来——它就是"反向扫描 +
+三角求逆梯度 + 块内梯度"的 Triton 落地。**这套 backward 结构（BPTT 扫描 + WY 求逆梯度）对 12-KDA / 13-GDN / 15-SSD
+的 chunk_bwd 同样成立**，只是多了门控/双门的链式项。
+""".strip()))
+
+# ============================ 7. §7 bench ============================
+cells.append(md(r"""
+## 7. 复杂度：$O(S)$ vs full attention $O(S^2)$
 
 DeltaNet 是线性复杂度，长序列优于 full attention。delta rule 的纠错让它在固定状态大小下记忆质量优于朴素 linear attention。
 """.strip()))
@@ -316,9 +430,22 @@ for i, S in enumerate(Ss):
     print(f"S={S:>5}  full {full[i]:6.3f}ms  DeltaNet {dn_t[i]:6.3f}ms ({full[i]/dn_t[i]:.2f}×)")
 """.strip()))
 
+# ============================ 动手练习 ============================
+cells.append(md(r"""
+## 🛠 动手练习
+
+1. **前向替换 = 高效求逆**：把 WY 的 `for i in range(1, C)` 前向替换循环换成 `torch.linalg.inv(I + T)`，验证两者结果一致——
+   理解"前向替换"只是利用下三角结构高效地算 $(I+T)^{-1}$。
+2. **谱半径爆炸**：去掉 `l2norm=True`，用未归一化的 `k` 跑 recurrent，观察状态如何发散成 nan（此时 $(I-\beta kk^\top)$ 的谱
+   半径 > 1）。这解释了为什么 delta-rule 系必须 L2norm。
+3. **覆盖强度**：把 $\beta$ 从 1 调到 0.3，重做 §1 的"同 key 覆盖"实验，看读出从"完全覆盖成 $v_b$"变成"$v_a,v_b$ 的混合"。
+4. **反向加倍**（§6 延伸）：在手推 backward 里把 `torch.linalg.inv` 换成 §4.1 的前向替换、并实现其反向，验证 $dk$ 不变——
+   体会 fla 的 `solve_tril` 为何要单独写一个 bwd kernel。
+""".strip()))
+
 # ============================ 8. 收尾 ============================
 cells.append(md(r"""
-## 7. 收尾
+## 8. 收尾
 
 DeltaNet 给线性注意力装上了"橡皮擦"：
 
@@ -327,7 +454,9 @@ DeltaNet 给线性注意力装上了"橡皮擦"：
    这是后续 KDA / GDN 全系的共同基础；
 3. **WY 表示**（§3）：把块内串行擦除写成 $(I+T)U=\beta V$，一次三角求逆解开，是 chunk 并行的地基；DeltaNet 无门控、
    是最干净的原型（$T_{ij}=\beta_i k_i^\top k_j$）；
-4. **逐段精读 + 完整 kernel**（§4–§5）：可读参考实现的每段都对应公式与 Triton 位置，本仓库完整解耦自 fla、与原版一致。
+4. **逐段精读 + 完整 kernel**（§4–§5）：可读参考实现的每段都对应公式与 Triton 位置，本仓库完整解耦自 fla、与原版一致；
+5. **反向传播**（§6）：backward = 块间 **BPTT 反向扫描** + **WY 求逆梯度** $dL=-T^\top dT\,T^\top$ + 块内梯度，手推与 autograd
+   逐位一致——这套结构（扫描 + 求逆梯度）对 12-KDA / 13-GDN / 15-SSD 的 chunk_bwd 同样成立。
 
 **下一章** → 12-kda：在这个擦除算子上叠加 per-channel 门控遗忘（KDA = GLA 门控 ⊕ DeltaNet 纠错），再到 13 章把 erase/write
 解耦成两个门（GDN/GDN-2）。

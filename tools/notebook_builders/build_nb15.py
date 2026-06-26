@@ -227,6 +227,50 @@ print(f"SSD(标量g) ≡ GLA(广播g)   max diff = {(o_ssd-o_gla).abs().max().it
 print("→ SSD 是 GLA 的标量衰减特例。'状态空间'与'线性注意力'两条线，在这里是同一个递推。")
 """.strip()))
 
+# ============================ §5.1 跨变体行为对比可视化 ============================
+cells.append(md(r"""
+### 5.1 线性家族行为全家福：累加 vs 遗忘 vs 覆盖
+
+把前面线性线/SSM 的几种"状态管理"放到**同一个任务**上对比，一眼看清本质区别。任务：固定一个 key $k=e_0$，在
+$t=0$ 写入 $v_0=e_1$、在 $t=20$ 用**同一个 key** 写入 $v_1=e_2$（其余步不写），之后每步用 $k$ 查询，看读出在
+$v_0,v_1$ 两个方向的分量随时间怎么变。三种机制会给出三种截然不同的行为。
+""".strip()))
+
+cells.append(code(r"""
+import sys as _sys
+_sys.path.insert(0, str(ROOT / "11-deltanet"))
+from deltanet import delta_rule_recurrent
+
+T, D = 80, 16
+dev = "cuda"
+k = torch.zeros(1, 1, T, D, device=dev)
+k[0, 0, 0, 0] = 1.0; k[0, 0, 20, 0] = 1.0                       # key=e0 只在两次写入时刻出现（其余步 k=0 不写不读）
+q = torch.zeros(1, 1, T, D, device=dev); q[0, 0, :, 0] = 1.0     # 每步都用 e0 查询
+v = torch.zeros(1, 1, T, D, device=dev)
+v[0, 0, 0, 1] = 1.0                                              # t=0  写 v0 = e1
+v[0, 0, 20, 2] = 1.0                                            # t=20 用同一 key 写 v1 = e2
+
+o_lin = ssd_recurrent(q, k, v, torch.zeros(1, 1, T, device=dev), scale=1.0)             # g=0 的 SSD = 朴素 linear
+o_ssd = ssd_recurrent(q, k, v, torch.full((1, 1, T), -0.05, device=dev), scale=1.0)    # 标量遗忘
+o_delta = delta_rule_recurrent(q, k, v, torch.ones(1, 1, T, device=dev), l2norm=False, scale=1.0)  # delta 覆盖
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.4), sharey=True)
+for ax, o, name in [(axes[0], o_lin, "linear（只加不减）"),
+                    (axes[1], o_ssd, "GLA/SSD（标量遗忘）"),
+                    (axes[2], o_delta, "DeltaNet（delta 覆盖）")]:
+    ax.plot(o[0, 0, :, 1].cpu(), label="读出 $v_0$ 方向", lw=2)
+    ax.plot(o[0, 0, :, 2].cpu(), label="读出 $v_1$ 方向", lw=2)
+    ax.axvline(0, color="g", ls=":", alpha=0.5); ax.axvline(20, color="r", ls=":", alpha=0.5)
+    ax.set_title(name); ax.set_xlabel("时间步"); ax.grid(alpha=0.3)
+axes[0].set_ylabel("读出分量"); axes[0].legend(fontsize=8)
+plt.suptitle("同一个 key 先写 $v_0$、t=20 再写 $v_1$：三种状态管理的本质区别", y=1.04)
+plt.tight_layout(); plt.show()
+print("linear：v0 写进去就永远在（t=20 后 v0、v1 都≈1，累加，分不清新旧）；")
+print("GLA/SSD：v0、v1 都按指数遗忘（标量衰减，旧信息自然淡出）；")
+print("DeltaNet：t=20 用同一 key 写 v1 时**擦掉**了 v0（v0→0、v1=1），实现'覆盖更新'——delta 的独门绝技。")
+""".strip()))
+
+
 # ============================ 7. §6 拆段精读 chunk ============================
 cells.append(md(r"""
 ## 6. 逐段精读：chunk 实现 = 块内对偶 + 块间递推
@@ -353,6 +397,16 @@ plt.tight_layout(); plt.show()
 for i, S in enumerate(Ss):
     print(f"S={S:>5}  full {full[i]:6.3f}ms  SSD {ssd_t[i]:6.3f}ms ({full[i]/ssd_t[i]:.2f}×)")
 """.strip()))
+
+# ============================ 动手练习 ============================
+cells.append(md(r"""
+## 🛠 动手练习
+
+1. **对偶更长**：在更长序列（`S=2048`）上验证 `ssd_recurrent ≡ ssd_attention_dual`，看半可分矩阵对偶是否依然精确（应仍到机器精度）。
+2. **变成 GLA**：把 SSD 的 per-head 标量 `g` 换成 per-channel（广播到 K 维喂给 `gla_recurrent`），它就是第 10 章的 GLA——对比输出，体会 "SSD = 标量衰减 GLA"。
+3. **selective 的记忆**：把 Mamba1 的 $\Delta$ 整体调大/调小，重做 §2 的状态衰减实验，看 selective SSM 的记忆窗口如何随 $\Delta$ 伸缩。
+""".strip()))
+
 
 # ============================ 10. 收尾 ============================
 cells.append(md(r"""
