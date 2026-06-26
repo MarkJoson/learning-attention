@@ -62,13 +62,15 @@ learning-attention —— 第三方来源与 License 汇总
 
 [6] fla-org/flash-linear-attention
     用途   : 线性注意力线的 chunk-parallel triton kernel —— GLA（10）+ DeltaNet（11，delta rule/WY）+ KDA（12，
-             gated delta）+ GDN/GDN-2（13，门控 delta，Qwen3-Next/3.5）
+             gated delta）+ GDN/GDN-2（13，门控 delta，Qwen3-Next/3.5）+ Mamba2 SSD（15，simple_gla = 标量衰减 GLA）
     文件   : ops/gla/chunk.py + ops/common/chunk_h.py + ops/utils/cumsum.py（解耦到本地三件套）；
-             ops/gated_delta_rule/* + ops/gdn2/* + ops/kda/*（13 章复用，详见各章 SOURCES.md）
+             ops/gated_delta_rule/* + ops/gdn2/* + ops/kda/*（13 章复用）；ops/simple_gla/* + ops/common/chunk_o.py
+             （15 章 Mamba2 SSD，详见各章 SOURCES.md）
     commit : 0b27f7b
     license: MIT (Copyright fla-org)
     用于   : 10-linear-attention/（GLA，3 文件）、11-deltanet/（DeltaNet，8 文件）、12-kda/（KDA，14 文件）、
-             13-gated-deltanet/（GDN 9 文件 + GDN-2 13 文件；no-op dispatch + cp stub + 跨章复用收敛闭包脱离 fla）
+             13-gated-deltanet/（GDN 9 文件 + GDN-2 13 文件）、15-mamba/（Mamba2 SSD = simple_gla，4 文件）；
+             均 no-op dispatch（13 另加 cp stub + 跨章复用）收敛闭包脱离 fla
     说明   : 完整拷贝核心 kernel（计算逻辑一字未改），仅把对 fla 框架的 import 改指向本地薄适配层
              _fla_*_compat.py（复现 exp2/autotune/check_shared_mem/input_guard 等），脱离 fla 包独立运行；
              定长与变长（cu_seqlens）序列均支持。各章 test_*_vs_fla 验证与 fla 原版近 bitwise 一致（含变长）。

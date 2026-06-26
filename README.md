@@ -56,6 +56,7 @@
 | 12 | [kda](./12-kda/) | 线性 | 自写 gated delta + 完整解耦 fla KDA kernel（Kimi Linear） | ✅ 完成 |
 | 13 | [gated-deltanet](./13-gated-deltanet/) | 线性 | 自写 GDN/GDN-2 recurrent + 完整解耦 fla GDN（9）+ GDN-2（13）kernel（Qwen3-Next/3.5） | ✅ 完成 |
 | 14 | [deepseek-v4](./14-deepseek-v4/) | 稀疏 | 自写 CSA+HCA 混合压缩稀疏简要版（讲机制 + 指向来源，DeepSeek V4） | ✅ 完成 |
+| 15 | [mamba](./15-mamba/) | 线性/SSM | 自写 Mamba1 selective SSM + Mamba2 SSD（解耦 fla simple_gla）+ SSD 对偶 notebook | ✅ 完成 |
 
 > 状态：✅ 完成 · 🚧 进行中 · 📋 计划。按"先做样板、验收后批量推进"的方式逐步补齐。
 
