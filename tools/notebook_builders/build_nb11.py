@@ -399,6 +399,34 @@ cells.append(md(r"""
 
 # ============================ 7. §7 bench ============================
 cells.append(md(r"""
+### 变长序列（cu_seqlens）—— 本章 kernel 同样支持
+
+和第 10 章 GLA 一样，本章 kernel 原生支持**变长**：多条不等长序列 packing 成一条（`batch=1`）+ `cu_seqlens` 标记边界，
+内部用 `prepare_chunk_indices` 让块不跨序列、状态在每条序列开头重置。**完整原理与图示见第 10 章 §6**；这里只验证本章
+`chunk_delta_rule` 同样满足"packed 一次 == 逐条单独跑"。
+""".strip()))
+
+cells.append(code(r"""
+H, D = 4, 64
+lens = [100, 250, 160]; total = sum(lens)                       # 3 条不等长序列
+cu = torch.tensor([0, 100, 350, 510], device="cuda", dtype=torch.int32)
+gg = torch.Generator("cuda").manual_seed(7)
+qv = torch.randn(1, total, H, D, device="cuda", dtype=torch.bfloat16, generator=gg)
+kv = torch.randn(1, total, H, D, device="cuda", dtype=torch.bfloat16, generator=gg)
+vv = torch.randn(1, total, H, D, device="cuda", dtype=torch.bfloat16, generator=gg)
+from _fla_delta_chunk import chunk_delta_rule
+bt = torch.rand(1, total, H, device="cuda", dtype=torch.bfloat16, generator=gg)
+o_packed = chunk_delta_rule(qv, kv, vv, bt, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)[0]                                          # (a) packed 一次：传 cu_seqlens
+o_each = []                                                     # (b) 逐条单独当定长各跑一次
+for i in range(len(lens)):
+    s, e = cu[i].item(), cu[i + 1].item()
+    o_each.append(chunk_delta_rule(qv[:, s:e].contiguous(), kv[:, s:e].contiguous(), vv[:, s:e].contiguous(), bt[:, s:e].contiguous(), use_qk_l2norm_in_kernel=True)[0])
+o_each = torch.cat(o_each, dim=1)
+print(f"packed(cu_seqlens 一次) vs 逐条单独跑   max diff: {(o_packed - o_each).abs().max().item():.2e}")
+print("→ packed≡逐条（bf16 逐位一致）：块不跨序列、状态在每条序列开头重置。变长完整原理见第 10 章 §6。")
+""".strip()))
+
+cells.append(md(r"""
 ## 7. 复杂度：$O(S)$ vs full attention $O(S^2)$
 
 DeltaNet 是线性复杂度，长序列优于 full attention。delta rule 的纠错让它在固定状态大小下记忆质量优于朴素 linear attention。
